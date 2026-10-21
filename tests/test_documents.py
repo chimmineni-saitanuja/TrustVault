@@ -46,14 +46,15 @@ class TestDocumentUploads(unittest.TestCase):
         self.transaction = self.connection.begin()
         self.session = TestingSessionLocal(bind=self.connection)
         self.storage = tempfile.TemporaryDirectory()
-        self.storage_path = Path(self.storage.name)
+        self.storage_path = Path(self.storage.name) / "private"
+        self.storage_path.mkdir()
 
         def _override_get_db():
             yield self.session
 
         app.dependency_overrides[get_db] = _override_get_db
         self.client = TestClient(app)
-        self.storage_setting = patch.object(settings, "STORAGE_DIR", self.storage.name)
+        self.storage_setting = patch.object(settings, "STORAGE_DIR", str(self.storage_path))
         self.storage_setting.start()
 
     def tearDown(self):
@@ -80,6 +81,11 @@ class TestDocumentUploads(unittest.TestCase):
         self.session.add(document)
         self.session.commit()
         return document
+
+    def _write_document_file(self, document: Document, content: bytes) -> Path:
+        path = self.storage_path / document.storage_path
+        path.write_bytes(content)
+        return path
 
     def _grant(self, owner: User, document: Document, grantee: User, permission: str = "view"):
         return self.client.post(
@@ -450,3 +456,171 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(self.session.query(AuditEvent).filter_by(
             action=AuditAction.PERMISSION_REVOKE
         ).count(), 0)
+
+    def test_owner_can_download_document_and_success_is_audited(self):
+        owner = make_user(self.session, email="download-owner@example.com")
+        document = self._make_document(owner, "owner-download")
+        content = b"private owner document"
+        stored_path = self._write_document_file(document, content)
+
+        response = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, content)
+        self.assertIn('filename="owner-download"', response.headers["content-disposition"])
+        self.assertNotIn(str(stored_path), response.text)
+        self.assertNotIn(document.storage_path, response.headers["content-disposition"])
+        event = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.DOCUMENT_DOWNLOAD)
+            .one()
+        )
+        self.assertEqual(event.outcome.value, "success")
+        self.assertEqual(event.resource_id, document.id)
+        self.assertNotIn(content.decode(), str(event.context_metadata))
+
+    def test_active_download_share_allows_download_and_view_share_does_not(self):
+        owner = make_user(self.session, email="permission-download-owner@example.com")
+        downloader = make_user(self.session, email="download-authorized@example.com")
+        viewer = make_user(self.session, email="download-viewer@example.com")
+        document = self._make_document(owner, "shared-download")
+        content = b"shared file body"
+        self._write_document_file(document, content)
+        self.assertEqual(self._grant(owner, document, downloader, "download").status_code, 201)
+        self.assertEqual(self._grant(owner, document, viewer, "view").status_code, 201)
+
+        permitted = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(downloader),
+        )
+        view_denied = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(viewer),
+        )
+
+        self.assertEqual(permitted.status_code, 200)
+        self.assertEqual(permitted.content, content)
+        self.assertEqual(view_denied.status_code, 404)
+        self.assertEqual(view_denied.json()["detail"], "Document not found")
+        denied_event = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.ACCESS_DENIED)
+            .one()
+        )
+        self.assertEqual(denied_event.outcome.value, "denied")
+        self.assertEqual(denied_event.actor_id, viewer.id)
+
+    def test_unrelated_user_and_admin_without_share_cannot_download(self):
+        owner = make_user(self.session, email="unrelated-download-owner@example.com")
+        unrelated = make_user(self.session, email="unrelated-downloader@example.com")
+        admin = make_user(
+            self.session,
+            email="unshared-download-admin@example.com",
+            role=UserRole.ADMIN,
+        )
+        document = self._make_document(owner, "unrelated")
+        self._write_document_file(document, b"restricted")
+
+        unrelated_response = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(unrelated),
+        )
+        admin_response = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(admin),
+        )
+
+        self.assertEqual(unrelated_response.status_code, 404)
+        self.assertEqual(admin_response.status_code, 404)
+        self.assertEqual(unrelated_response.json(), admin_response.json())
+        self.assertEqual(
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.ACCESS_DENIED)
+            .count(),
+            2,
+        )
+
+    def test_download_requires_authentication_and_hides_unknown_documents(self):
+        response = self.client.get("/documents/unknown-document/download")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("storage_path", response.text)
+
+        owner = make_user(self.session, email="unknown-download-owner@example.com")
+        unknown = self.client.get(
+            "/documents/unknown-document/download",
+            headers=self._authorization(owner),
+        )
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.json()["detail"], "Document not found")
+        self.assertEqual(
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.ACCESS_DENIED)
+            .count(),
+            1,
+        )
+
+    def test_missing_stored_file_returns_safe_not_found_and_audits_error(self):
+        owner = make_user(self.session, email="missing-download-owner@example.com")
+        document = self._make_document(owner, "missing-file")
+
+        response = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Document file not found")
+        self.assertNotIn(document.storage_path, response.text)
+        event = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.DOCUMENT_DOWNLOAD)
+            .one()
+        )
+        self.assertEqual(event.outcome.value, "error")
+        self.assertNotIn(document.storage_path, event.reason)
+
+    def test_download_rejects_storage_paths_outside_private_directory(self):
+        owner = make_user(self.session, email="traversal-download-owner@example.com")
+        document = self._make_document(owner, "traversal")
+        document.storage_path = "..\\outside.pdf"
+        self.session.commit()
+        outside_file = Path(self.storage.name) / "outside.pdf"
+        outside_file.write_bytes(b"must not be served")
+
+        response = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("must not be served", response.text)
+        self.assertEqual(
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.DOCUMENT_DOWNLOAD)
+            .one()
+            .outcome.value,
+            "error",
+        )
+
+    def test_download_audit_failure_does_not_return_file(self):
+        owner = make_user(self.session, email="audit-download-owner@example.com")
+        document = self._make_document(owner, "audit-failure")
+        self._write_document_file(document, b"must not be returned")
+
+        with (
+            patch.object(self.session, "commit", side_effect=SQLAlchemyError("database failure")),
+            patch.object(self.session, "rollback", wraps=self.session.rollback) as rollback,
+        ):
+            response = self.client.get(
+                f"/documents/{document.id}/download",
+                headers=self._authorization(owner),
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "Document request failed")
+        self.assertNotIn("must not be returned", response.text)
+        rollback.assert_called_once()

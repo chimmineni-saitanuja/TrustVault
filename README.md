@@ -12,7 +12,7 @@ TrustVault is a secure, enterprise-grade document sharing system designed to enf
 | :--- | :--- | :--- |
 | **Milestone 1** | **Project Foundation and Database** | **Completed** |
 | Milestone 2 | Authentication and Authorization | Implemented; pending review |
-| Milestone 3 | Document Management, Sharing and Audit | Upload foundation implemented; sharing and downloads pending |
+| Milestone 3 | Document Management, Sharing and Audit | Upload, sharing, and authorized downloads implemented |
 | Milestone 4 | Frontend and Integration | Pending Review |
 | Milestone 5 | Security Verification, Deployment and Submission | Pending Review |
 
@@ -135,6 +135,34 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 - **Root Metadata**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
 - **System Health Check**: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
 
+### Running the Frontend
+
+The React, TypeScript, and Vite application is in `frontend/`. Install Node.js 20 or newer (including npm), then use two terminals from the project root.
+
+In the first terminal, start the backend in the project's virtual environment:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+In the second terminal, install the frontend dependencies once and start Vite:
+
+```powershell
+Set-Location frontend
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The backend already permits this local frontend origin through CORS. The frontend uses `http://127.0.0.1:8000` as its default API base URL; to point it at another backend, set `VITE_API_BASE_URL` before starting Vite, for example:
+
+```powershell
+$env:VITE_API_BASE_URL = "http://127.0.0.1:8000"
+npm run dev
+```
+
+This setting is a public API address, not a secret. Never put backend credentials or the signing key in frontend environment variables. The frontend keeps the bearer token in browser session storage and clears it when you log out or the session becomes invalid.
+
 ---
 
 ### Authentication and Authorization
@@ -155,12 +183,14 @@ Registration and its audit event are committed atomically. Login audit persisten
 - `GET /documents/` lists only the authenticated user's documents, and `GET /documents/{document_id}` returns metadata only for a document that user owns. Missing and other users' document IDs both return `404`.
 - Successful reads and denied detail lookups are audited. API responses never include internal storage paths or generated storage names.
 - Document owners and admins can manage shares with `POST /documents/{document_id}/shares`, `GET /documents/{document_id}/shares`, and `DELETE /documents/{document_id}/shares/{share_id}`. Grants support `view` and `download` permissions for existing active users; duplicate active grants are rejected, and revoked grants can be reactivated.
-- Share grants and revocations are recorded atomically with the permission change. Share-management responses contain recipient identity and permission metadata only, not storage details or password hashes. The download permission is recorded but no download endpoint is implemented.
-- Keep `STORAGE_DIR` outside any public/static web root. Sharing metadata is managed through the endpoints above, but the application does not expose a file download endpoint yet.
+- Share grants and revocations are recorded atomically with the permission change. Share-management responses contain recipient identity and permission metadata only, not storage details or password hashes.
+- `GET /documents/{document_id}/download` allows owners to download their files and other active users only when they have an active explicit `download` grant. A `view` grant and admin role alone do not permit file downloads.
+- Downloads resolve generated storage locations under `STORAGE_DIR`; paths outside that directory and missing files are rejected without revealing filesystem paths. Successful downloads and denied attempts are audited before a response is sent.
+- Keep `STORAGE_DIR` outside any public/static web root.
 
 ## Running Automated Tests
 
-Run the full test suite, including health checks, model constraints, audit immutability, authentication, document upload, sharing and revocation, audit behavior, and role enforcement:
+Run the full test suite, including health checks, model constraints, audit immutability, authentication, document upload, sharing, revocation, downloads, audit behavior, and role enforcement:
 
 ```bash
 python -m pytest -v

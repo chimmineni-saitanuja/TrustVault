@@ -6,6 +6,7 @@ from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -61,6 +62,18 @@ def _commit_access_audit(db: Session, audit: AuditEvent) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document request failed",
         )
+
+
+def _resolve_document_storage_path(storage_path: str) -> Path | None:
+    """Resolve a stored relative path only when it remains inside private storage."""
+    try:
+        storage_root = Path(settings.STORAGE_DIR).resolve(strict=True)
+        resolved_path = (storage_root / storage_path).resolve(strict=True)
+        resolved_path.relative_to(storage_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    return resolved_path if resolved_path.is_file() else None
 
 
 def _get_shareable_document(
@@ -344,6 +357,95 @@ def revoke_document_share(
 
 
 @router.get(
+    "/{document_id}/download",
+    response_class=FileResponse,
+    summary="Download an authorized document",
+)
+def download_document(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """Download a document owned by the user or explicitly shared for download."""
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if document is None:
+            has_download_access = False
+        elif document.owner_id == current_user.id:
+            has_download_access = True
+        else:
+            has_download_access = (
+                db.query(DocumentPermission)
+                .filter(
+                    DocumentPermission.document_id == document.id,
+                    DocumentPermission.grantee_id == current_user.id,
+                    DocumentPermission.permission_level == PermissionLevel.DOWNLOAD,
+                    DocumentPermission.is_revoked.is_(False),
+                )
+                .first()
+                is not None
+            )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document download authorization lookup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+    if document is None or not has_download_access:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=AuditAction.ACCESS_DENIED,
+                resource_id=document_id[:255],
+                outcome=AuditOutcome.DENIED,
+                reason="Document not found or download permission not granted",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+
+    storage_path = _resolve_document_storage_path(document.storage_path)
+    if storage_path is None:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=AuditAction.DOCUMENT_DOWNLOAD,
+                resource_id=document.id,
+                outcome=AuditOutcome.ERROR,
+                reason="Stored document is unavailable",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document file not found",
+        )
+
+    _commit_access_audit(
+        db,
+        AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.DOCUMENT_DOWNLOAD,
+            resource_id=document.id,
+            outcome=AuditOutcome.SUCCESS,
+        ),
+    )
+    return FileResponse(
+        path=storage_path,
+        media_type=document.content_type,
+        filename=document.name,
+    )
+
+
+@router.get(
     "/",
     response_model=list[DocumentUploadResponse],
     summary="List the current user's documents",
@@ -446,7 +548,7 @@ def get_document(
     summary="Upload a document",
     description=(
         "Stores a validated file in private local storage and records its metadata. "
-        "The authenticated user becomes its owner. Sharing and downloading are not provided."
+        "The authenticated user becomes its owner. File access uses separate authorized endpoints."
     ),
 )
 async def upload_document(
