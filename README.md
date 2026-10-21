@@ -154,11 +154,13 @@ Registration and its audit event are committed atomically. Login audit persisten
 - Upload size is capped by `MAX_UPLOAD_SIZE_BYTES` (default: 10 MiB). If database or audit persistence fails, the transaction is rolled back and the stored file is removed.
 - `GET /documents/` lists only the authenticated user's documents, and `GET /documents/{document_id}` returns metadata only for a document that user owns. Missing and other users' document IDs both return `404`.
 - Successful reads and denied detail lookups are audited. API responses never include internal storage paths or generated storage names.
-- Keep `STORAGE_DIR` outside any public/static web root. The application does not expose file download or sharing endpoints; those capabilities and their authorization are not implemented here.
+- Document owners and admins can manage shares with `POST /documents/{document_id}/shares`, `GET /documents/{document_id}/shares`, and `DELETE /documents/{document_id}/shares/{share_id}`. Grants support `view` and `download` permissions for existing active users; duplicate active grants are rejected, and revoked grants can be reactivated.
+- Share grants and revocations are recorded atomically with the permission change. Share-management responses contain recipient identity and permission metadata only, not storage details or password hashes. The download permission is recorded but no download endpoint is implemented.
+- Keep `STORAGE_DIR` outside any public/static web root. Sharing metadata is managed through the endpoints above, but the application does not expose a file download endpoint yet.
 
 ## Running Automated Tests
 
-Run the full test suite, including health checks, model constraints, audit immutability, authentication, document upload validation, audit behavior, and role enforcement:
+Run the full test suite, including health checks, model constraints, audit immutability, authentication, document upload, sharing and revocation, audit behavior, and role enforcement:
 
 ```bash
 python -m pytest -v

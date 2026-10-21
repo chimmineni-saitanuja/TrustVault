@@ -6,14 +6,28 @@ from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models import AuditAction, AuditEvent, AuditOutcome, Document, User
-from app.schemas.documents import DocumentUploadResponse
+from app.models import (
+    AuditAction,
+    AuditEvent,
+    AuditOutcome,
+    Document,
+    DocumentPermission,
+    PermissionLevel,
+    User,
+    UserRole,
+    get_utc_now,
+)
+from app.schemas.documents import (
+    DocumentShareResponse,
+    DocumentUploadResponse,
+    ShareGrantRequest,
+)
 
 logger = logging.getLogger("trustvault.documents")
 
@@ -47,6 +61,286 @@ def _commit_access_audit(db: Session, audit: AuditEvent) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document request failed",
         )
+
+
+def _get_shareable_document(
+    document_id: str,
+    current_user: User,
+    db: Session,
+) -> Document:
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document sharing lookup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+    if document is None or (
+        document.owner_id != current_user.id and current_user.role != UserRole.ADMIN
+    ):
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=AuditAction.ACCESS_DENIED,
+                resource_id=document_id[:255],
+                outcome=AuditOutcome.DENIED,
+                reason="Document not found or user cannot manage shares",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+    return document
+
+
+def _share_response(share: DocumentPermission) -> DocumentShareResponse:
+    return DocumentShareResponse(
+        id=share.id,
+        document_id=share.document_id,
+        grantee_id=share.grantee_id,
+        grantee_name=share.grantee.name,
+        grantee_email=share.grantee.email,
+        granted_by_id=share.granted_by_id,
+        permission_level=share.permission_level,
+        is_revoked=share.is_revoked,
+        granted_at=share.granted_at,
+        revoked_at=share.revoked_at,
+    )
+
+
+@router.post(
+    "/{document_id}/shares",
+    response_model=DocumentShareResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Grant document access",
+)
+def grant_document_share(
+    document_id: str,
+    request_body: ShareGrantRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DocumentShareResponse:
+    """Grant view or download permission to an active user."""
+    document = _get_shareable_document(document_id, current_user, db)
+    if request_body.user_id == document.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot grant a share to the document owner",
+        )
+
+    try:
+        grantee = (
+            db.query(User)
+            .filter(User.id == request_body.user_id, User.is_active.is_(True))
+            .first()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Share recipient lookup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Share request failed",
+        )
+    if grantee is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Active user not found",
+        )
+
+    permission_level = PermissionLevel(request_body.permission.value)
+    try:
+        share = (
+            db.query(DocumentPermission)
+            .filter(
+                DocumentPermission.document_id == document.id,
+                DocumentPermission.grantee_id == grantee.id,
+                DocumentPermission.permission_level == permission_level,
+            )
+            .first()
+        )
+        if share is not None and not share.is_revoked:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This permission has already been granted",
+            )
+
+        if share is None:
+            share = DocumentPermission(
+                document_id=document.id,
+                grantee_id=grantee.id,
+                granted_by_id=current_user.id,
+                permission_level=permission_level,
+                is_revoked=False,
+                grantee=grantee,
+            )
+            db.add(share)
+        else:
+            share.granted_by_id = current_user.id
+            share.is_revoked = False
+            share.granted_at = get_utc_now()
+            share.revoked_at = None
+            share.grantee = grantee
+
+        audit = AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.PERMISSION_GRANT,
+            resource_id=document.id,
+            outcome=AuditOutcome.SUCCESS,
+            context_metadata={
+                "grantee_id": grantee.id,
+                "permission": permission_level.value,
+            },
+        )
+        db.add(audit)
+        db.commit()
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        try:
+            duplicate = (
+                db.query(DocumentPermission)
+                .filter(
+                    DocumentPermission.document_id == document.id,
+                    DocumentPermission.grantee_id == request_body.user_id,
+                    DocumentPermission.permission_level == permission_level,
+                    DocumentPermission.is_revoked.is_(False),
+                )
+                .first()
+            )
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Share grant conflict lookup failed")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Share request failed",
+            )
+        if duplicate is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This permission has already been granted",
+            )
+        logger.exception("Share grant persistence failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Share request failed",
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Share grant persistence failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Share request failed",
+        )
+
+    return _share_response(share)
+
+
+@router.get(
+    "/{document_id}/shares",
+    response_model=list[DocumentShareResponse],
+    summary="List document shares",
+)
+def list_document_shares(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[DocumentShareResponse]:
+    """List document shares for the owner or an admin."""
+    document = _get_shareable_document(document_id, current_user, db)
+    try:
+        shares = (
+            db.query(DocumentPermission)
+            .filter(DocumentPermission.document_id == document.id)
+            .order_by(DocumentPermission.granted_at.desc())
+            .all()
+        )
+        response = [_share_response(share) for share in shares]
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document share listing failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Share request failed",
+        )
+
+    _commit_access_audit(
+        db,
+        AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.DOCUMENT_READ,
+            resource_id=document.id,
+            outcome=AuditOutcome.SUCCESS,
+            context_metadata={"operation": "list_shares", "share_count": len(shares)},
+        ),
+    )
+    return response
+
+
+@router.delete(
+    "/{document_id}/shares/{share_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke document access",
+)
+def revoke_document_share(
+    document_id: str,
+    share_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Revoke an existing share for the owner or an admin."""
+    document = _get_shareable_document(document_id, current_user, db)
+    try:
+        share = (
+            db.query(DocumentPermission)
+            .filter(
+                DocumentPermission.id == share_id,
+                DocumentPermission.document_id == document.id,
+            )
+            .first()
+        )
+        if share is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
+        if share.is_revoked:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Share has already been revoked",
+            )
+
+        share.is_revoked = True
+        share.revoked_at = get_utc_now()
+        audit = AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.PERMISSION_REVOKE,
+            resource_id=document.id,
+            outcome=AuditOutcome.SUCCESS,
+            context_metadata={
+                "share_id": share.id,
+                "grantee_id": share.grantee_id,
+                "permission": share.permission_level.value,
+            },
+        )
+        db.add(audit)
+        db.commit()
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Share revoke persistence failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Share request failed",
+        )
+    return None
 
 
 @router.get(

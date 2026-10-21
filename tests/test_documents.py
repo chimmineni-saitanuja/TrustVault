@@ -11,7 +11,15 @@ from starlette.testclient import TestClient
 from app.config import settings
 from app.database import get_db
 from app.main import app
-from app.models import AuditAction, AuditEvent, Document, User
+from app.models import (
+    AuditAction,
+    AuditEvent,
+    Document,
+    DocumentPermission,
+    PermissionLevel,
+    User,
+    UserRole,
+)
 from app.security import create_access_token
 from tests.conftest import (
     TestingSessionLocal,
@@ -72,6 +80,13 @@ class TestDocumentUploads(unittest.TestCase):
         self.session.add(document)
         self.session.commit()
         return document
+
+    def _grant(self, owner: User, document: Document, grantee: User, permission: str = "view"):
+        return self.client.post(
+            f"/documents/{document.id}/shares",
+            headers=self._authorization(owner),
+            json={"user_id": grantee.id, "permission": permission},
+        )
 
     def test_upload_stores_file_metadata_owner_and_audit(self):
         user = make_user(self.session, email="uploader@example.com")
@@ -235,3 +250,203 @@ class TestDocumentUploads(unittest.TestCase):
             self.session.query(AuditEvent).filter_by(outcome="denied").count(),
             2,
         )
+
+    def test_owner_can_grant_view_and_download_permissions(self):
+        owner = make_user(self.session, email="share-owner@example.com")
+        grantee = make_user(self.session, email="share-recipient@example.com")
+        document = self._make_document(owner, "shared")
+
+        view_response = self._grant(owner, document, grantee, "view")
+        download_response = self._grant(owner, document, grantee, "download")
+
+        self.assertEqual(view_response.status_code, 201)
+        self.assertEqual(view_response.json()["permission_level"], "view")
+        self.assertEqual(view_response.json()["grantee_id"], grantee.id)
+        self.assertEqual(download_response.status_code, 201)
+        self.assertEqual(download_response.json()["permission_level"], "download")
+        self.assertNotIn("storage_path", view_response.json())
+        self.assertNotIn("password_hash", view_response.text)
+        self.assertEqual(self.session.query(DocumentPermission).count(), 2)
+        grant_events = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.PERMISSION_GRANT)
+            .all()
+        )
+        self.assertEqual(len(grant_events), 2)
+
+    def test_share_grant_rejects_missing_inactive_and_owner_recipients(self):
+        owner = make_user(self.session, email="invalid-share-owner@example.com")
+        inactive = make_user(self.session, email="inactive-recipient@example.com")
+        inactive.is_active = False
+        self.session.commit()
+        document = self._make_document(owner, "restricted")
+
+        missing = self.client.post(
+            f"/documents/{document.id}/shares",
+            headers=self._authorization(owner),
+            json={"user_id": "missing-user", "permission": "view"},
+        )
+        inactive_response = self._grant(owner, document, inactive)
+        owner_response = self._grant(owner, document, owner)
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(inactive_response.status_code, 404)
+        self.assertEqual(owner_response.status_code, 400)
+        self.assertEqual(self.session.query(DocumentPermission).count(), 0)
+
+    def test_share_grant_rejects_invalid_and_duplicate_permissions(self):
+        owner = make_user(self.session, email="duplicate-share-owner@example.com")
+        grantee = make_user(self.session, email="duplicate-share-recipient@example.com")
+        document = self._make_document(owner, "duplicate")
+
+        invalid = self._grant(owner, document, grantee, "edit")
+        first = self._grant(owner, document, grantee)
+        duplicate = self._grant(owner, document, grantee)
+
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(self.session.query(DocumentPermission).count(), 1)
+
+    def test_non_owner_cannot_grant_list_or_revoke_shares(self):
+        owner = make_user(self.session, email="authorize-share-owner@example.com")
+        other_user = make_user(self.session, email="authorize-share-other@example.com")
+        recipient = make_user(self.session, email="authorize-share-recipient@example.com")
+        document = self._make_document(owner, "owner-only")
+        share = self._grant(owner, document, recipient).json()
+        headers = self._authorization(other_user)
+
+        grant = self.client.post(
+            f"/documents/{document.id}/shares",
+            headers=headers,
+            json={"user_id": other_user.id, "permission": "view"},
+        )
+        listing = self.client.get(f"/documents/{document.id}/shares", headers=headers)
+        revoke = self.client.delete(
+            f"/documents/{document.id}/shares/{share['id']}",
+            headers=headers,
+        )
+
+        self.assertEqual(grant.status_code, 404)
+        self.assertEqual(listing.status_code, 404)
+        self.assertEqual(revoke.status_code, 404)
+        self.assertFalse(self.session.query(DocumentPermission).one().is_revoked)
+
+    def test_owner_can_list_shares_and_admin_can_manage_them(self):
+        owner = make_user(self.session, email="list-shares-owner@example.com")
+        admin = make_user(
+            self.session,
+            email="list-shares-admin@example.com",
+            role=UserRole.ADMIN,
+        )
+        recipient = make_user(self.session, email="list-shares-recipient@example.com")
+        admin_recipient = make_user(self.session, email="admin-share-recipient@example.com")
+        document = self._make_document(owner, "listed")
+        self.assertEqual(self._grant(owner, document, recipient).status_code, 201)
+
+        owner_list = self.client.get(
+            f"/documents/{document.id}/shares",
+            headers=self._authorization(owner),
+        )
+        admin_list = self.client.get(
+            f"/documents/{document.id}/shares",
+            headers=self._authorization(admin),
+        )
+        admin_grant = self._grant(admin, document, admin_recipient)
+
+        self.assertEqual(owner_list.status_code, 200)
+        self.assertEqual(len(owner_list.json()), 1)
+        self.assertEqual(admin_list.status_code, 200)
+        self.assertEqual(admin_grant.status_code, 201)
+        admin_revoke = self.client.delete(
+            f"/documents/{document.id}/shares/{admin_grant.json()['id']}",
+            headers=self._authorization(admin),
+        )
+        self.assertEqual(admin_revoke.status_code, 204)
+
+    def test_revoked_permission_can_be_granted_again_without_duplicate_rows(self):
+        owner = make_user(self.session, email="regrant-owner@example.com")
+        recipient = make_user(self.session, email="regrant-recipient@example.com")
+        document = self._make_document(owner, "regrant")
+        first = self._grant(owner, document, recipient)
+        share_id = first.json()["id"]
+        revoked = self.client.delete(
+            f"/documents/{document.id}/shares/{share_id}",
+            headers=self._authorization(owner),
+        )
+
+        regrant = self._grant(owner, document, recipient)
+
+        self.assertEqual(revoked.status_code, 204)
+        self.assertEqual(regrant.status_code, 201)
+        self.assertEqual(regrant.json()["id"], share_id)
+        self.assertFalse(regrant.json()["is_revoked"])
+        self.assertEqual(self.session.query(DocumentPermission).count(), 1)
+
+    def test_owner_can_revoke_share_and_audit_it(self):
+        owner = make_user(self.session, email="revoke-owner@example.com")
+        recipient = make_user(self.session, email="revoke-recipient@example.com")
+        document = self._make_document(owner, "revoke")
+        share = self._grant(owner, document, recipient).json()
+
+        response = self.client.delete(
+            f"/documents/{document.id}/shares/{share['id']}",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        persisted_share = self.session.query(DocumentPermission).one()
+        self.assertTrue(persisted_share.is_revoked)
+        self.assertIsNotNone(persisted_share.revoked_at)
+        event = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.PERMISSION_REVOKE)
+            .one()
+        )
+        self.assertEqual(event.resource_id, document.id)
+        self.assertEqual(event.context_metadata["share_id"], share["id"])
+
+        repeated = self.client.delete(
+            f"/documents/{document.id}/shares/{share['id']}",
+            headers=self._authorization(owner),
+        )
+        self.assertEqual(repeated.status_code, 409)
+
+    def test_grant_audit_failure_rolls_back_share(self):
+        owner = make_user(self.session, email="grant-failure-owner@example.com")
+        recipient = make_user(self.session, email="grant-failure-recipient@example.com")
+        document = self._make_document(owner, "grant-failure")
+
+        with patch.object(self.session, "commit", side_effect=SQLAlchemyError("database failure")):
+            response = self._grant(owner, document, recipient)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(self.session.query(DocumentPermission).count(), 0)
+        self.assertEqual(self.session.query(AuditEvent).count(), 0)
+
+    def test_revoke_audit_failure_rolls_back_revocation(self):
+        owner = make_user(self.session, email="revoke-failure-owner@example.com")
+        recipient = make_user(self.session, email="revoke-failure-recipient@example.com")
+        document = self._make_document(owner, "revoke-failure")
+        share = self._grant(owner, document, recipient).json()
+
+        self.session.close()
+        self.session = TestingSessionLocal(
+            bind=self.connection,
+            join_transaction_mode="create_savepoint",
+        )
+        with (
+            patch.object(self.session, "commit", side_effect=SQLAlchemyError("database failure")),
+            patch.object(self.session, "rollback", wraps=self.session.rollback) as rollback,
+        ):
+            response = self.client.delete(
+                f"/documents/{document.id}/shares/{share['id']}",
+                headers=self._authorization(owner),
+            )
+
+        self.assertEqual(response.status_code, 500)
+        rollback.assert_called_once()
+        self.assertFalse(self.session.query(DocumentPermission).one().is_revoked)
+        self.assertEqual(self.session.query(AuditEvent).filter_by(
+            action=AuditAction.PERMISSION_REVOKE
+        ).count(), 0)

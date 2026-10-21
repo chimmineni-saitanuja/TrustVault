@@ -40,6 +40,8 @@ class UserRole(str, enum.Enum):
 
 class PermissionLevel(str, enum.Enum):
     """Document permission levels."""
+    VIEW = "view"
+    DOWNLOAD = "download"
     READ = "read"
     EDIT = "edit"
 
