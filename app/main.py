@@ -20,6 +20,7 @@ from app import __version__
 from app.config import settings
 from app.database import get_db
 from app.routers import auth as auth_router
+from app.routers import documents as documents_router
 from app.routers import users as users_router
 
 logging.basicConfig(
@@ -47,6 +48,7 @@ app = FastAPI(
 )
 
 app.include_router(auth_router.router, prefix="/auth", tags=["Authentication"])
+app.include_router(documents_router.router, prefix="/documents", tags=["Documents"])
 app.include_router(users_router.router, prefix="/users", tags=["Users"])
 
 # CORS configuration

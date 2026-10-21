@@ -12,7 +12,7 @@ TrustVault is a secure, enterprise-grade document sharing system designed to enf
 | :--- | :--- | :--- |
 | **Milestone 1** | **Project Foundation and Database** | **Completed** |
 | Milestone 2 | Authentication and Authorization | Implemented; pending review |
-| Milestone 3 | Document Management, Sharing and Audit | Pending Review |
+| Milestone 3 | Document Management, Sharing and Audit | Upload foundation implemented; sharing and downloads pending |
 | Milestone 4 | Frontend and Integration | Pending Review |
 | Milestone 5 | Security Verification, Deployment and Submission | Pending Review |
 
@@ -43,9 +43,11 @@ trustvault/
 │   ├── dependencies.py       # Active-user authentication and role checks
 │   ├── routers/
 │   │   ├── auth.py           # Registration, login, and current-user profile
+│   │   ├── documents.py      # Authenticated document upload
 │   │   └── users.py          # Admin-only user listing
 │   └── schemas/
-│       └── auth.py           # Authentication request and public response schemas
+│       ├── auth.py           # Authentication request and public response schemas
+│       └── documents.py      # Public document upload metadata
 ├── migrations/
 │   ├── env.py                # Alembic migration runner
 │   ├── script.py.mako        # Migration template
@@ -54,6 +56,7 @@ trustvault/
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py           # In-memory SQLite fixtures and TestClient overrides
+│   ├── test_documents.py     # Document upload, validation, ownership, and rollback tests
 │   ├── test_health.py        # Root and live/failed /health endpoint tests
 │   └── test_models.py        # Model validation, denied-audit context, immutability tests
 ├── .env.example              # Environment variables template
@@ -143,9 +146,17 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 Registration and its audit event are committed atomically. Login audit persistence must succeed before a success or failure response is returned. Public profiles never include password hashes.
 
+### Document Upload Foundation
+
+- `POST /documents/upload` requires a valid bearer token and records the authenticated user as the document owner.
+- Uploads accept PDF, PNG, JPEG, and UTF-8 text files with matching filename extensions and media types. Binary file signatures are checked.
+- Files are streamed to `STORAGE_DIR` (default: `storage/documents`) under generated names. The original name is stored only as document metadata; the storage path is not returned by the API.
+- Upload size is capped by `MAX_UPLOAD_SIZE_BYTES` (default: 10 MiB). If database or audit persistence fails, the transaction is rolled back and the stored file is removed.
+- Keep `STORAGE_DIR` outside any public/static web root. The application does not expose file download or sharing endpoints; those capabilities and their authorization are not implemented here.
+
 ## Running Automated Tests
 
-Run the full test suite, including health checks, model constraints, audit immutability, authentication, JWT validation, audit behavior, and role enforcement:
+Run the full test suite, including health checks, model constraints, audit immutability, authentication, document upload validation, audit behavior, and role enforcement:
 
 ```bash
 python -m pytest -v
