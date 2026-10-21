@@ -11,7 +11,7 @@ TrustVault is a secure, enterprise-grade document sharing system designed to enf
 | Milestone | Scope | Status |
 | :--- | :--- | :--- |
 | **Milestone 1** | **Project Foundation and Database** | **Completed** |
-| Milestone 2 | Authentication and Authorization | Pending Review |
+| Milestone 2 | Authentication and Authorization | Implemented; pending review |
 | Milestone 3 | Document Management, Sharing and Audit | Pending Review |
 | Milestone 4 | Frontend and Integration | Pending Review |
 | Milestone 5 | Security Verification, Deployment and Submission | Pending Review |
@@ -24,7 +24,7 @@ TrustVault is a secure, enterprise-grade document sharing system designed to enf
 - **Database**: PostgreSQL 17 (production/dev) with in-memory SQLite support for fast test isolation
 - **ORM**: SQLAlchemy 2.0 (strict type annotations, session lifecycle management)
 - **Migrations**: Alembic (version-controlled, reproducible migrations)
-- **Authentication**: Argon2 password hashing & signed JWT tokens (configured for Milestone 2)
+- **Authentication**: Argon2id password hashing and HS256-signed JWT access tokens
 - **Audit Security**: Append-only audit model with ORM-level event listeners preventing modification or deletion
 - **Testing**: Python `unittest` test suite and Pytest-compatible fixtures
 
@@ -39,7 +39,13 @@ trustvault/
 │   ├── config.py             # Pydantic BaseSettings environment configuration
 │   ├── database.py           # SQLAlchemy 2.0 engine, SessionLocal, get_db lifecycle
 │   ├── main.py               # FastAPI entry point, root and /health endpoints
-│   └── models.py             # Users, Documents, Permissions, and AuditEvent models
+│   ├── models.py             # Users, Documents, Permissions, and AuditEvent models
+│   ├── dependencies.py       # Active-user authentication and role checks
+│   ├── routers/
+│   │   ├── auth.py           # Registration, login, and current-user profile
+│   │   └── users.py          # Admin-only user listing
+│   └── schemas/
+│       └── auth.py           # Authentication request and public response schemas
 ├── migrations/
 │   ├── env.py                # Alembic migration runner
 │   ├── script.py.mako        # Migration template
@@ -128,12 +134,21 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 ---
 
+### Authentication and Authorization
+
+- `POST /auth/register` creates a viewer account; passwords are hashed with Argon2id.
+- `POST /auth/login` returns an HS256-signed JWT access token. Failed attempts are audited and return a generic `401` message.
+- `GET /auth/me` returns the authenticated active user's public profile.
+- `GET /users/` lists users for admins only; other authenticated roles receive `403`.
+
+Registration and its audit event are committed atomically. Login audit persistence must succeed before a success or failure response is returned. Public profiles never include password hashes.
+
 ## Running Automated Tests
 
-Run the full test suite verifying endpoints, model constraints, denied audit recording, and audit immutability:
+Run the full test suite, including health checks, model constraints, audit immutability, authentication, JWT validation, audit behavior, and role enforcement:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest -v
 ```
 
-All 8 automated tests run against an isolated in-memory SQLite database (`StaticPool`), ensuring zero contamination of production or development data.
+Tests use an isolated in-memory SQLite database, so they do not modify the configured development or production database.

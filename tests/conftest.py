@@ -12,6 +12,8 @@ from starlette.testclient import TestClient
 
 from app.database import Base, get_db
 from app.main import app
+from app.models import User, UserRole
+from app.security import hash_password
 
 # Graceful pytest import to support environments where pytest has dependency collisions
 try:
@@ -53,6 +55,31 @@ def setup_test_db():
 def teardown_test_db():
     """Drop all database schema tables."""
     Base.metadata.drop_all(bind=test_engine)
+
+
+def make_user(
+    db,
+    *,
+    name: str = "Test User",
+    email: str,
+    password: str = "testpass123",
+    role: UserRole = UserRole.VIEWER,
+) -> User:
+    """Create and commit a User with a real Argon2id hash.
+
+    Used by test_auth and test_roles to avoid duplicating setup code.
+    The plaintext password is used transiently and is not stored or logged.
+    """
+    user = User(
+        name=name,
+        email=email,
+        password_hash=hash_password(password),
+        role=role,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    return user
 
 
 if pytest is not None:

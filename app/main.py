@@ -10,7 +10,7 @@ import os
 import time
 from typing import Any, Dict
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -19,6 +19,8 @@ from sqlalchemy.orm import Session
 from app import __version__
 from app.config import settings
 from app.database import get_db
+from app.routers import auth as auth_router
+from app.routers import users as users_router
 
 logging.basicConfig(
     level=logging.INFO if not settings.DEBUG else logging.DEBUG,
@@ -43,6 +45,9 @@ app = FastAPI(
     description="Secure document sharing platform with document-level permissions and audit trail.",
     lifespan=lifespan,
 )
+
+app.include_router(auth_router.router, prefix="/auth", tags=["Authentication"])
+app.include_router(users_router.router, prefix="/users", tags=["Users"])
 
 # CORS configuration
 app.add_middleware(
