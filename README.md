@@ -152,6 +152,8 @@ Registration and its audit event are committed atomically. Login audit persisten
 - Uploads accept PDF, PNG, JPEG, and UTF-8 text files with matching filename extensions and media types. Binary file signatures are checked.
 - Files are streamed to `STORAGE_DIR` (default: `storage/documents`) under generated names. The original name is stored only as document metadata; the storage path is not returned by the API.
 - Upload size is capped by `MAX_UPLOAD_SIZE_BYTES` (default: 10 MiB). If database or audit persistence fails, the transaction is rolled back and the stored file is removed.
+- `GET /documents/` lists only the authenticated user's documents, and `GET /documents/{document_id}` returns metadata only for a document that user owns. Missing and other users' document IDs both return `404`.
+- Successful reads and denied detail lookups are audited. API responses never include internal storage paths or generated storage names.
 - Keep `STORAGE_DIR` outside any public/static web root. The application does not expose file download or sharing endpoints; those capabilities and their authorization are not implemented here.
 
 ## Running Automated Tests

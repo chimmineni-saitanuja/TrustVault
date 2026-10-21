@@ -61,6 +61,18 @@ class TestDocumentUploads(unittest.TestCase):
         token = create_access_token(user.id)
         return {"Authorization": f"Bearer {token}"}
 
+    def _make_document(self, owner: User, name: str) -> Document:
+        document = Document(
+            owner_id=owner.id,
+            name=name,
+            storage_path=f"generated-{name}.pdf",
+            file_size=12,
+            content_type="application/pdf",
+        )
+        self.session.add(document)
+        self.session.commit()
+        return document
+
     def test_upload_stores_file_metadata_owner_and_audit(self):
         user = make_user(self.session, email="uploader@example.com")
         content = b"%PDF-1.7\nsafe sample"
@@ -150,3 +162,76 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(self.session.query(Document).count(), 0)
         self.assertEqual(self.session.query(AuditEvent).count(), 0)
         self.assertEqual(list(self.storage_path.iterdir()), [])
+
+    def test_listing_returns_only_current_users_documents_without_storage_paths(self):
+        owner = make_user(self.session, email="list-owner@example.com")
+        other_owner = make_user(self.session, email="list-other@example.com")
+        own_document = self._make_document(owner, "owned")
+        self._make_document(other_owner, "other")
+
+        response = self.client.get(
+            "/documents/",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.json()], [own_document.id])
+        self.assertNotIn("storage_path", response.json()[0])
+        self.assertNotIn("generated-owned.pdf", response.text)
+        event = self.session.query(AuditEvent).one()
+        self.assertEqual(event.action, AuditAction.DOCUMENT_READ)
+        self.assertEqual(event.context_metadata["operation"], "list")
+
+    def test_owner_can_view_document_metadata_without_storage_path(self):
+        owner = make_user(self.session, email="details-owner@example.com")
+        document = self._make_document(owner, "private")
+
+        response = self.client.get(
+            f"/documents/{document.id}",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], document.id)
+        self.assertEqual(response.json()["name"], "private")
+        self.assertNotIn("storage_path", response.json())
+        self.assertNotIn(document.storage_path, response.text)
+        event = self.session.query(AuditEvent).one()
+        self.assertEqual(event.action, AuditAction.DOCUMENT_READ)
+        self.assertEqual(event.resource_id, document.id)
+
+    def test_listing_and_details_require_authentication(self):
+        document = self._make_document(
+            make_user(self.session, email="auth-required-owner@example.com"),
+            "restricted",
+        )
+
+        listing = self.client.get("/documents/")
+        details = self.client.get(f"/documents/{document.id}")
+
+        self.assertEqual(listing.status_code, 401)
+        self.assertEqual(details.status_code, 401)
+
+    def test_other_users_document_is_hidden_with_consistent_not_found(self):
+        owner = make_user(self.session, email="private-owner@example.com")
+        other_user = make_user(self.session, email="private-other@example.com")
+        document = self._make_document(owner, "secret")
+        headers = self._authorization(other_user)
+
+        forbidden_document = self.client.get(
+            f"/documents/{document.id}",
+            headers=headers,
+        )
+        unknown_document = self.client.get(
+            "/documents/nonexistent-document-id",
+            headers=headers,
+        )
+
+        self.assertEqual(forbidden_document.status_code, 404)
+        self.assertEqual(unknown_document.status_code, 404)
+        self.assertEqual(forbidden_document.json(), unknown_document.json())
+        self.assertEqual(forbidden_document.json()["detail"], "Document not found")
+        self.assertEqual(
+            self.session.query(AuditEvent).filter_by(outcome="denied").count(),
+            2,
+        )

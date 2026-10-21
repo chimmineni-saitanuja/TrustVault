@@ -36,6 +36,115 @@ def _remove_partial_file(path: Path) -> None:
         logger.exception("Could not remove a partial document upload")
 
 
+def _commit_access_audit(db: Session, audit: AuditEvent) -> None:
+    try:
+        db.add(audit)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document access audit persistence failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+
+@router.get(
+    "/",
+    response_model=list[DocumentUploadResponse],
+    summary="List the current user's documents",
+)
+def list_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[DocumentUploadResponse]:
+    """List only documents owned by the authenticated user."""
+    try:
+        documents = (
+            db.query(Document)
+            .filter(Document.owner_id == current_user.id)
+            .order_by(Document.created_at.desc())
+            .all()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document listing failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+    _commit_access_audit(
+        db,
+        AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.DOCUMENT_READ,
+            outcome=AuditOutcome.SUCCESS,
+            context_metadata={"operation": "list", "document_count": len(documents)},
+        ),
+    )
+    return [DocumentUploadResponse.model_validate(document) for document in documents]
+
+
+@router.get(
+    "/{document_id}",
+    response_model=DocumentUploadResponse,
+    summary="View owned document metadata",
+)
+def get_document(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DocumentUploadResponse:
+    """Return document metadata only when it belongs to the authenticated user."""
+    try:
+        document = (
+            db.query(Document)
+            .filter(
+                Document.id == document_id,
+                Document.owner_id == current_user.id,
+            )
+            .first()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document details lookup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+    if document is None:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=AuditAction.ACCESS_DENIED,
+                resource_id=document_id[:255],
+                outcome=AuditOutcome.DENIED,
+                reason="Document not found or not owned by user",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+
+    _commit_access_audit(
+        db,
+        AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.DOCUMENT_READ,
+            resource_id=document.id,
+            outcome=AuditOutcome.SUCCESS,
+        ),
+    )
+    return DocumentUploadResponse.model_validate(document)
+
+
 @router.post(
     "/upload",
     response_model=DocumentUploadResponse,
