@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import {
   ArrowDownToLine,
   ArrowRight,
+  Activity,
   Check,
   ChevronDown,
   CircleHelp,
@@ -23,7 +24,7 @@ import {
   X,
 } from "lucide-react";
 
-import { api, ApiError, type DocumentRecord, type DocumentShare, type SharePermission, type SharedDocumentRecord, type UserProfile } from "./api";
+import { api, ApiError, type ActivityEvent, type DocumentRecord, type DocumentShare, type SharePermission, type SharedDocumentRecord, type UserProfile } from "./api";
 
 const TOKEN_KEY = "trustvault.access-token";
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -50,6 +51,13 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
+function formatActivityDate(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
 function fileIcon(contentType: string) {
   if (contentType.startsWith("image/")) return <FileImage aria-hidden="true" />;
   if (contentType === "application/pdf") return <FileText aria-hidden="true" />;
@@ -61,12 +69,15 @@ export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [sharedDocuments, setSharedDocuments] = useState<SharedDocumentRecord[]>([]);
+  const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([]);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [authLoading, setAuthLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(Boolean(token));
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [sharedLoading, setSharedLoading] = useState(Boolean(token));
   const [sharedError, setSharedError] = useState<string | null>(null);
+  const [activityLoading, setActivityLoading] = useState(Boolean(token));
+  const [activityError, setActivityError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -78,6 +89,7 @@ export default function App() {
   const [shareBusy, setShareBusy] = useState(false);
   const [recipientId, setRecipientId] = useState("");
   const [permission, setPermission] = useState<SharePermission>("view");
+  const [shareExpiresAt, setShareExpiresAt] = useState("");
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [previewingId, setPreviewingId] = useState<string | null>(null);
 
@@ -89,6 +101,9 @@ export default function App() {
     setSharedDocuments([]);
     setSharedError(null);
     setSharedLoading(false);
+    setActivityEvents([]);
+    setActivityError(null);
+    setActivityLoading(false);
     setShareRows({});
     setShareTarget(null);
   }, []);
@@ -130,10 +145,27 @@ export default function App() {
     }
   }, [clearSession]);
 
+  const refreshActivity = useCallback(async (activeToken: string) => {
+    setActivityLoading(true);
+    setActivityError(null);
+    try {
+      setActivityEvents(await api.activity(activeToken));
+    } catch (error) {
+      setActivityError(messageFromError(error));
+      if (error instanceof ApiError && error.status === 401) {
+        clearSession();
+        setNotice({ kind: "error", text: "Your session has expired. Sign in again to continue." });
+      }
+    } finally {
+      setActivityLoading(false);
+    }
+  }, [clearSession]);
+
   useEffect(() => {
     if (!token) {
       setSessionLoading(false);
       setSharedLoading(false);
+      setActivityLoading(false);
       return;
     }
 
@@ -146,6 +178,7 @@ export default function App() {
         const rows = await api.documents(token);
         if (active) setDocuments(rows);
         await refreshSharedDocuments(token);
+        await refreshActivity(token);
       } catch (error) {
         if (!active) return;
         if (error instanceof ApiError && error.status === 401) {
@@ -163,7 +196,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [token, clearSession, refreshSharedDocuments]);
+  }, [token, clearSession, refreshSharedDocuments, refreshActivity]);
 
   const visibleDocuments = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -232,7 +265,9 @@ export default function App() {
       } catch (error) {
         reportRequestError(error);
       }
+      await refreshActivity(token);
     } catch (error) {
+      await refreshActivity(token);
       reportRequestError(error);
     } finally {
       setUploading(false);
@@ -253,7 +288,9 @@ export default function App() {
     try {
       const shares = await api.shares(token, documentId);
       setShareRows((current) => ({ ...current, [documentId]: shares }));
+      await refreshActivity(token);
     } catch (error) {
+      await refreshActivity(token);
       reportRequestError(error);
     } finally {
       setSharesLoading(false);
@@ -267,17 +304,31 @@ export default function App() {
       setNotice({ kind: "error", text: "Enter the recipient's user ID." });
       return;
     }
+    const expiration = shareExpiresAt ? new Date(shareExpiresAt) : null;
+    if (expiration && (!Number.isFinite(expiration.getTime()) || expiration <= new Date())) {
+      setNotice({ kind: "error", text: "Choose an expiration date and time in the future." });
+      return;
+    }
     setShareBusy(true);
     setNotice(null);
     try {
-      const share = await api.grantShare(token, documentId, id, permission);
+      const share = await api.grantShare(
+        token,
+        documentId,
+        id,
+        permission,
+        expiration?.toISOString() ?? null,
+      );
       setShareRows((current) => ({
         ...current,
         [documentId]: [share, ...(current[documentId] ?? [])],
       }));
       setRecipientId("");
+      setShareExpiresAt("");
       setNotice({ kind: "success", text: `Access granted with ${permission} permission.` });
+      await refreshActivity(token);
     } catch (error) {
+      await refreshActivity(token);
       reportRequestError(error);
     } finally {
       setShareBusy(false);
@@ -298,7 +349,9 @@ export default function App() {
         ),
       }));
       setNotice({ kind: "success", text: "Access has been revoked." });
+      await refreshActivity(token);
     } catch (error) {
+      await refreshActivity(token);
       reportRequestError(error);
     } finally {
       setShareBusy(false);
@@ -320,7 +373,9 @@ export default function App() {
       anchor.remove();
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
       setNotice({ kind: "success", text: `${document.name} is downloading.` });
+      await refreshActivity(token);
     } catch (error) {
+      await refreshActivity(token);
       reportRequestError(error);
     } finally {
       setDownloadingId(null);
@@ -344,8 +399,10 @@ export default function App() {
       const objectUrl = URL.createObjectURL(blob);
       previewTab.location.href = objectUrl;
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 5 * 60 * 1000);
+      await refreshActivity(token);
     } catch (error) {
       previewTab.close();
+      await refreshActivity(token);
       reportRequestError(error);
     } finally {
       setPreviewingId(null);
@@ -395,6 +452,10 @@ export default function App() {
           <Share2 size={18} />
           <span>Shared with me</span>
           <span className="nav-count">{sharedDocuments.length}</span>
+        </a>
+        <a className="nav-item" href="#activity-log">
+          <Activity size={18} />
+          <span>Activity Log</span>
         </a>
         <div className="sidebar-note">
           <div className="sidebar-note-icon"><LockKeyhole size={17} /></div>
@@ -595,11 +656,19 @@ export default function App() {
                               <option value="download">Download file</option>
                             </select>
                           </label>
+                          <label>
+                            <span>Expires (optional)</span>
+                            <input
+                              type="datetime-local"
+                              value={shareExpiresAt}
+                              onChange={(event) => setShareExpiresAt(event.target.value)}
+                            />
+                          </label>
                           <button className="button button-dark" type="submit" disabled={shareBusy}>
                             <Plus size={16} /> Grant access
                           </button>
                         </form>
-                        <p className="share-hint">The backend currently requires a recipient’s user ID. Recipients see shared documents in their Shared with me section.</p>
+                        <p className="share-hint">Set an optional expiration; otherwise access does not expire. Recipients see active grants in Shared with me.</p>
 
                         <div className="share-list">
                           {sharesLoading ? (
@@ -610,7 +679,17 @@ export default function App() {
                             (shareRows[document.id] ?? []).map((share) => (
                               <div className={`share-row ${share.is_revoked ? "share-revoked" : ""}`} key={share.id}>
                                 <span className="avatar avatar-share">{share.grantee_name.slice(0, 1).toUpperCase()}</span>
-                                <span className="share-person"><strong>{share.grantee_name}</strong><small>{share.grantee_email}</small></span>
+                                <span className="share-person">
+                                  <strong>{share.grantee_name}</strong>
+                                  <small>{share.grantee_email}</small>
+                                  <small>
+                                    {share.expires_at
+                                      ? new Date(share.expires_at) <= new Date()
+                                        ? "Expired"
+                                        : `Expires ${formatActivityDate(share.expires_at)}`
+                                      : "No expiration"}
+                                  </small>
+                                </span>
                                 <span className={`permission-badge permission-${share.permission_level}`}>{share.permission_level}</span>
                                 {share.is_revoked ? (
                                   <span className="revoked-label"><X size={13} /> Revoked</span>
@@ -644,7 +723,12 @@ export default function App() {
               </div>
               <button
                 className="button button-quiet"
-                onClick={() => void refreshSharedDocuments(token)}
+                onClick={() => {
+                  void (async () => {
+                    await refreshSharedDocuments(token);
+                    await refreshActivity(token);
+                  })();
+                }}
                 disabled={sharedLoading}
               >
                 {sharedLoading ? <span className="spinner spinner-small" /> : "Refresh"}
@@ -658,7 +742,12 @@ export default function App() {
                 <span>{sharedError}</span>
                 <button
                   className="button button-quiet"
-                  onClick={() => void refreshSharedDocuments(token)}
+                  onClick={() => {
+                    void (async () => {
+                      await refreshSharedDocuments(token);
+                      await refreshActivity(token);
+                    })();
+                  }}
                 >
                   Try again
                 </button>
@@ -731,6 +820,68 @@ export default function App() {
                 ))}
               </div>
             )}
+          </section>
+
+          <section className="documents-section activity-section" id="activity-log">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">YOUR RECENT ACCOUNT ACTIVITY</p>
+                <h2>Activity Log <span className="heading-count">{activityEvents.length}</span></h2>
+              </div>
+              <button
+                className="button button-quiet"
+                onClick={() => void refreshActivity(token)}
+                disabled={activityLoading}
+              >
+                {activityLoading ? <span className="spinner spinner-small" /> : "Refresh"}
+              </button>
+            </div>
+
+            {activityLoading ? (
+              <div className="state-card"><span className="spinner" /><span>Loading activity…</span></div>
+            ) : activityError ? (
+              <div className="state-card shared-error" role="alert">
+                <span>{activityError}</span>
+                <button
+                  className="button button-quiet"
+                  onClick={() => void refreshActivity(token)}
+                >
+                  Try again
+                </button>
+              </div>
+            ) : activityEvents.length === 0 ? (
+              <div className="empty-state">
+                <span className="empty-icon"><Activity size={24} /></span>
+                <h3>No activity to show</h3>
+                <p>Your account and document activity will appear here.</p>
+              </div>
+            ) : (
+              <div className="activity-list">
+                {activityEvents.map((event) => (
+                  <article className="activity-row" key={event.id}>
+                    <span className={`activity-status activity-${event.outcome}`} aria-label={event.outcome} />
+                    <div className="activity-details">
+                      <strong>{event.action.replace(/[._]/g, " ")}</strong>
+                      {(event.document_name || event.related_user_name || event.related_user_email) && (
+                        <small>
+                          {event.document_name && <>Document: {event.document_name}</>}
+                          {event.document_name && (event.related_user_name || event.related_user_email) && " · "}
+                          {(event.related_user_name || event.related_user_email) && (
+                            <>User: {event.related_user_name ?? event.related_user_email}</>
+                          )}
+                          {event.related_user_name && event.related_user_email && ` (${event.related_user_email})`}
+                        </small>
+                      )}
+                    </div>
+                    <span className={`activity-outcome activity-outcome-${event.outcome}`}>
+                      {event.outcome}
+                    </span>
+                    <time dateTime={event.created_at}>{formatActivityDate(event.created_at)}</time>
+                  </article>
+                ))}
+              </div>
+            )}
+            <p className="activity-note">Showing up to 100 recent events performed by your account. Sensitive request details are not displayed.</p>
           </section>
 
           <footer className="page-footer">

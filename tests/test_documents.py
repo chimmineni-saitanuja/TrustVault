@@ -2,6 +2,8 @@
 
 import tempfile
 import unittest
+import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,11 +89,22 @@ class TestDocumentUploads(unittest.TestCase):
         path.write_bytes(content)
         return path
 
-    def _grant(self, owner: User, document: Document, grantee: User, permission: str = "view"):
+    def _grant(
+        self,
+        owner: User,
+        document: Document,
+        grantee: User,
+        permission: str = "view",
+        expires_at: datetime | None = None,
+    ):
         return self.client.post(
             f"/documents/{document.id}/shares",
             headers=self._authorization(owner),
-            json={"user_id": grantee.id, "permission": permission},
+            json={
+                "user_id": grantee.id,
+                "permission": permission,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+            },
         )
 
     def test_upload_stores_file_metadata_owner_and_audit(self):
@@ -110,9 +123,11 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(payload["name"], "report.pdf")
         self.assertEqual(payload["file_size"], len(content))
         self.assertEqual(payload["content_type"], "application/pdf")
+        self.assertNotIn("sha256", payload)
         self.assertNotIn("storage_path", payload)
 
         document = self.session.query(Document).one()
+        self.assertEqual(document.sha256, hashlib.sha256(content).hexdigest())
         stored_file = self.storage_path / document.storage_path
         self.assertTrue(stored_file.is_file())
         self.assertNotEqual(stored_file.name, "report.pdf")
@@ -121,6 +136,69 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(event.action, AuditAction.DOCUMENT_UPLOAD)
         self.assertEqual(event.resource_id, document.id)
         self.assertEqual(event.actor_id, user.id)
+
+    def test_tampered_file_is_not_served_and_records_safe_error_audit(self):
+        owner = make_user(self.session, email="integrity-tamper-owner@example.com")
+        document = self._make_document(owner, "tampered")
+        original_content = b"%PDF-1.7\noriginal"
+        self._write_document_file(document, original_content)
+        document.sha256 = hashlib.sha256(original_content).hexdigest()
+        self.session.commit()
+        tampered_content = b"%PDF-1.7\ntampered"
+        (self.storage_path / document.storage_path).write_bytes(tampered_content)
+
+        for endpoint, action in (
+            ("preview", AuditAction.DOCUMENT_READ),
+            ("download", AuditAction.DOCUMENT_DOWNLOAD),
+        ):
+            response = self.client.get(
+                f"/documents/{document.id}/{endpoint}",
+                headers=self._authorization(owner),
+            )
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual(
+                response.json()["detail"],
+                "Document integrity verification failed",
+            )
+            self.assertNotIn(tampered_content, response.content)
+            event = (
+                self.session.query(AuditEvent)
+                .filter_by(action=action, outcome="error")
+                .one()
+            )
+            self.assertEqual(event.resource_id, document.id)
+            self.assertNotIn(document.storage_path, event.reason)
+            self.assertNotIn(tampered_content.decode(), event.reason)
+
+    def test_legacy_document_gets_a_hash_on_first_authorized_access(self):
+        owner = make_user(self.session, email="integrity-legacy-owner@example.com")
+        document = self._make_document(owner, "legacy")
+        content = b"%PDF-1.7\nlegacy content"
+        self._write_document_file(document, content)
+        self.assertIsNone(document.sha256)
+
+        response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(owner),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, content)
+        self.assertEqual(document.sha256, hashlib.sha256(content).hexdigest())
+
+    def test_unauthorized_request_does_not_backfill_legacy_document_hash(self):
+        owner = make_user(self.session, email="integrity-private-owner@example.com")
+        outsider = make_user(self.session, email="integrity-private-outsider@example.com")
+        document = self._make_document(owner, "legacy-private")
+        self._write_document_file(document, b"%PDF-1.7\nprivate")
+
+        response = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(outsider),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(document.sha256)
 
     def test_upload_requires_authentication(self):
         response = self.client.post(
@@ -209,6 +287,7 @@ class TestDocumentUploads(unittest.TestCase):
         outsider = make_user(self.session, email="shared-list-outsider@example.com")
         view_and_download = self._make_document(owner, "view-and-download")
         revoked = self._make_document(owner, "revoked")
+        expired = self._make_document(owner, "expired")
         unshared = self._make_document(owner, "unshared")
         self.assertEqual(self._grant(owner, view_and_download, recipient, "view").status_code, 201)
         self.assertEqual(
@@ -223,6 +302,17 @@ class TestDocumentUploads(unittest.TestCase):
             ).status_code,
             204,
         )
+        self.session.add(
+            DocumentPermission(
+                document_id=expired.id,
+                grantee_id=recipient.id,
+                granted_by_id=owner.id,
+                permission_level=PermissionLevel.VIEW,
+                is_revoked=False,
+                expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            )
+        )
+        self.session.commit()
         self._grant(owner, unshared, outsider, "download")
 
         response = self.client.get(
@@ -241,6 +331,7 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertCountEqual(shared["permissions"], ["view", "download"])
         self.assertNotIn("storage_path", shared)
         self.assertNotIn(revoked.id, response.text)
+        self.assertNotIn(expired.id, response.text)
         self.assertNotIn(unshared.id, response.text)
         event = (
             self.session.query(AuditEvent)
@@ -375,6 +466,44 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(first.status_code, 201)
         self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(self.session.query(DocumentPermission).count(), 1)
+
+    def test_share_expiration_must_be_timezone_aware_and_in_the_future(self):
+        owner = make_user(self.session, email="expiration-validation-owner@example.com")
+        recipient = make_user(self.session, email="expiration-validation-recipient@example.com")
+        document = self._make_document(owner, "expiration-validation")
+
+        naive_expiration = datetime.now() + timedelta(hours=1)
+        past_expiration = datetime.now(timezone.utc) - timedelta(minutes=1)
+        naive = self._grant(owner, document, recipient, expires_at=naive_expiration)
+        past = self._grant(owner, document, recipient, expires_at=past_expiration)
+
+        self.assertEqual(naive.status_code, 422)
+        self.assertEqual(past.status_code, 422)
+        self.assertEqual(self.session.query(DocumentPermission).count(), 0)
+
+    def test_expired_grant_can_be_reactivated_with_a_new_expiration(self):
+        owner = make_user(self.session, email="expiration-regrant-owner@example.com")
+        recipient = make_user(self.session, email="expiration-regrant-recipient@example.com")
+        document = self._make_document(owner, "expiration-regrant")
+        old_grant = DocumentPermission(
+            document_id=document.id,
+            grantee_id=recipient.id,
+            granted_by_id=owner.id,
+            permission_level=PermissionLevel.VIEW,
+            is_revoked=False,
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        self.session.add(old_grant)
+        self.session.commit()
+        new_expiration = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        regrant = self._grant(owner, document, recipient, expires_at=new_expiration)
+
+        self.assertEqual(regrant.status_code, 201)
+        self.assertEqual(regrant.json()["id"], old_grant.id)
+        self.assertFalse(regrant.json()["is_revoked"])
+        self.assertIsNotNone(regrant.json()["expires_at"])
         self.assertEqual(self.session.query(DocumentPermission).count(), 1)
 
     def test_non_owner_cannot_grant_list_or_revoke_shares(self):
@@ -604,22 +733,105 @@ class TestDocumentUploads(unittest.TestCase):
         recipient = make_user(self.session, email="preview-revoked-user@example.com")
         document = self._make_document(owner, "revoked-preview")
         self._write_document_file(document, b"revoked")
-        share = self._grant(owner, document, recipient, "view").json()
-        self.assertEqual(
-            self.client.delete(
-                f"/documents/{document.id}/shares/{share['id']}",
-                headers=self._authorization(owner),
-            ).status_code,
-            204,
-        )
+        for permission in ("view", "download"):
+            share = self._grant(owner, document, recipient, permission).json()
+            self.assertEqual(
+                self.client.delete(
+                    f"/documents/{document.id}/shares/{share['id']}",
+                    headers=self._authorization(owner),
+                ).status_code,
+                204,
+            )
 
-        response = self.client.get(
+        preview = self.client.get(
             f"/documents/{document.id}/preview",
             headers=self._authorization(recipient),
         )
+        download = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(recipient),
+        )
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"], "Document not found")
+        self.assertEqual(preview.status_code, 404)
+        self.assertEqual(download.status_code, 404)
+        self.assertEqual(preview.json()["detail"], "Document not found")
+        self.assertEqual(download.json()["detail"], "Document not found")
+
+    def test_expired_download_grant_cannot_preview_or_download_and_is_not_listed(self):
+        owner = make_user(self.session, email="expiration-expired-owner@example.com")
+        recipient = make_user(self.session, email="expiration-expired-recipient@example.com")
+        document = self._make_document(owner, "expired-download")
+        self._write_document_file(document, b"expired")
+        self.session.add(
+            DocumentPermission(
+                document_id=document.id,
+                grantee_id=recipient.id,
+                granted_by_id=owner.id,
+                permission_level=PermissionLevel.DOWNLOAD,
+                is_revoked=False,
+                expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            )
+        )
+        self.session.commit()
+
+        shared = self.client.get(
+            "/documents/shared-with-me",
+            headers=self._authorization(recipient),
+        )
+        preview = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(recipient),
+        )
+        download = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(recipient),
+        )
+
+        self.assertEqual(shared.status_code, 200)
+        self.assertEqual(shared.json(), [])
+        self.assertEqual(preview.status_code, 404)
+        self.assertEqual(download.status_code, 404)
+
+    def test_active_expiring_and_non_expiring_grants_allow_only_their_permissions(self):
+        owner = make_user(self.session, email="expiration-active-owner@example.com")
+        expiring_downloader = make_user(self.session, email="expiration-active-recipient@example.com")
+        non_expiring_viewer = make_user(self.session, email="non-expiring-recipient@example.com")
+        document = self._make_document(owner, "active-expiration")
+        content = b"authorized document"
+        self._write_document_file(document, content)
+        expiration = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        expiring_grant = self._grant(
+            owner,
+            document,
+            expiring_downloader,
+            "download",
+            expiration,
+        )
+        non_expiring_grant = self._grant(owner, document, non_expiring_viewer, "view")
+
+        self.assertEqual(expiring_grant.status_code, 201)
+        self.assertIsNotNone(expiring_grant.json()["expires_at"])
+        self.assertEqual(non_expiring_grant.status_code, 201)
+        self.assertIsNone(non_expiring_grant.json()["expires_at"])
+        for user in (expiring_downloader, non_expiring_viewer):
+            preview = self.client.get(
+                f"/documents/{document.id}/preview",
+                headers=self._authorization(user),
+            )
+            self.assertEqual(preview.status_code, 200)
+            self.assertEqual(preview.content, content)
+        allowed_download = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(expiring_downloader),
+        )
+        denied_download = self.client.get(
+            f"/documents/{document.id}/download",
+            headers=self._authorization(non_expiring_viewer),
+        )
+        self.assertEqual(allowed_download.status_code, 200)
+        self.assertEqual(allowed_download.content, content)
+        self.assertEqual(denied_download.status_code, 404)
 
     def test_preview_requires_view_or_download_permission(self):
         owner = make_user(self.session, email="preview-limited-owner@example.com")

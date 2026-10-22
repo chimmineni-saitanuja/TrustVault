@@ -696,6 +696,96 @@ p {
   margin-top: 28px;
 }
 
+.activity-section {
+  margin-top: 28px;
+}
+
+.activity-list {
+  overflow: hidden;
+  border: 1px solid #e9eaf0;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 3px 16px rgb(43 44 72 / 2%);
+}
+
+.activity-row {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+}
+
+.activity-row + .activity-row {
+  border-top: 1px solid #f0f0f4;
+}
+
+.activity-status {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #48a17d;
+}
+
+.activity-denied {
+  background: #cb6a6a;
+}
+
+.activity-error {
+  background: #d39a4d;
+}
+
+.activity-details {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.activity-details strong {
+  color: #424559;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.activity-details small {
+  overflow: hidden;
+  color: #9497a7;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-outcome {
+  color: #42876c;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.activity-outcome-denied {
+  color: #bd6464;
+}
+
+.activity-outcome-error {
+  color: #b57b2f;
+}
+
+.activity-row time {
+  flex: 0 0 auto;
+  color: #8e91a1;
+  font-size: 9px;
+}
+
+.activity-note {
+  margin: 9px 2px 0;
+  color: #a0a2af;
+  font-size: 9px;
+}
+
 .section-heading {
   display: flex;
   align-items: flex-end;
@@ -930,7 +1020,7 @@ p {
 
 .grant-form {
   display: grid;
-  grid-template-columns: minmax(170px, 1fr) 170px auto;
+  grid-template-columns: minmax(170px, 1fr) 160px minmax(190px, 220px) auto;
   align-items: end;
   gap: 9px;
 }

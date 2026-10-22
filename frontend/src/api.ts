@@ -40,7 +40,19 @@ export interface DocumentShare {
   permission_level: "view" | "download" | "read" | "edit";
   is_revoked: boolean;
   granted_at: string;
+  expires_at: string | null;
   revoked_at: string | null;
+}
+
+export interface ActivityEvent {
+  id: string;
+  action: string;
+  outcome: "success" | "denied" | "error";
+  created_at: string;
+  document_id: string | null;
+  document_name: string | null;
+  related_user_name: string | null;
+  related_user_email: string | null;
 }
 
 export type SharePermission = "view" | "download";
@@ -137,6 +149,10 @@ export const api = {
     return request<SharedDocumentRecord[]>("/documents/shared-with-me", token);
   },
 
+  activity(token: string): Promise<ActivityEvent[]> {
+    return request<ActivityEvent[]>("/activity/", token);
+  },
+
   upload(token: string, file: File): Promise<DocumentRecord> {
     const form = new FormData();
     form.append("file", file);
@@ -152,10 +168,11 @@ export const api = {
     documentId: string,
     userId: string,
     permission: SharePermission,
+    expiresAt: string | null = null,
   ): Promise<DocumentShare> {
     return request<DocumentShare>(`/documents/${encodeURIComponent(documentId)}/shares`, token, {
       method: "POST",
-      body: JSON.stringify({ user_id: userId, permission }),
+      body: JSON.stringify({ user_id: userId, permission, expires_at: expiresAt }),
     });
   },
 

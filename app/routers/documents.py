@@ -1,12 +1,14 @@
 """Authenticated document upload endpoint."""
 
 import codecs
+import hashlib
 import logging
 from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -46,6 +48,29 @@ _ALLOWED_TYPES = {
 }
 
 
+def _active_permission_conditions():
+    now = get_utc_now()
+    return (
+        DocumentPermission.is_revoked.is_(False),
+        or_(
+            DocumentPermission.expires_at.is_(None),
+            DocumentPermission.expires_at > now,
+        ),
+    )
+
+
+def _is_active_permission(permission: DocumentPermission, now=None) -> bool:
+    if permission.is_revoked:
+        return False
+    if permission.expires_at is None:
+        return True
+    current_time = now or get_utc_now()
+    expiration = permission.expires_at
+    if expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=current_time.tzinfo)
+    return expiration > current_time
+
+
 def _remove_partial_file(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
@@ -76,6 +101,65 @@ def _resolve_document_storage_path(storage_path: str) -> Path | None:
         return None
 
     return resolved_path if resolved_path.is_file() else None
+
+
+def _verify_document_integrity(
+    document: Document,
+    file_path: Path,
+    current_user: User,
+    db: Session,
+    action: AuditAction,
+) -> None:
+    digest = hashlib.sha256()
+    try:
+        with file_path.open("rb") as source:
+            while chunk := source.read(_CHUNK_SIZE):
+                digest.update(chunk)
+    except OSError:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=action,
+                resource_id=document.id,
+                outcome=AuditOutcome.ERROR,
+                reason="Stored document could not be verified",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document integrity verification failed",
+        )
+
+    calculated_sha256 = digest.hexdigest()
+    if document.sha256 is None:
+        document.sha256 = calculated_sha256
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Legacy document integrity baseline persistence failed")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Document request failed",
+            )
+    elif document.sha256 != calculated_sha256:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=action,
+                resource_id=document.id,
+                outcome=AuditOutcome.ERROR,
+                reason="Stored document integrity verification failed",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document integrity verification failed",
+        )
 
 
 def _get_shareable_document(
@@ -125,6 +209,7 @@ def _share_response(share: DocumentPermission) -> DocumentShareResponse:
         permission_level=share.permission_level,
         is_revoked=share.is_revoked,
         granted_at=share.granted_at,
+        expires_at=share.expires_at,
         revoked_at=share.revoked_at,
     )
 
@@ -179,7 +264,7 @@ def grant_document_share(
             )
             .first()
         )
-        if share is not None and not share.is_revoked:
+        if share is not None and _is_active_permission(share):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This permission has already been granted",
@@ -192,6 +277,7 @@ def grant_document_share(
                 granted_by_id=current_user.id,
                 permission_level=permission_level,
                 is_revoked=False,
+                expires_at=request_body.expires_at,
                 grantee=grantee,
             )
             db.add(share)
@@ -199,6 +285,7 @@ def grant_document_share(
             share.granted_by_id = current_user.id
             share.is_revoked = False
             share.granted_at = get_utc_now()
+            share.expires_at = request_body.expires_at
             share.revoked_at = None
             share.grantee = grantee
 
@@ -211,6 +298,11 @@ def grant_document_share(
             context_metadata={
                 "grantee_id": grantee.id,
                 "permission": permission_level.value,
+                "expires_at": (
+                    request_body.expires_at.isoformat()
+                    if request_body.expires_at
+                    else None
+                ),
             },
         )
         db.add(audit)
@@ -226,7 +318,7 @@ def grant_document_share(
                     DocumentPermission.document_id == document.id,
                     DocumentPermission.grantee_id == request_body.user_id,
                     DocumentPermission.permission_level == permission_level,
-                    DocumentPermission.is_revoked.is_(False),
+                    *_active_permission_conditions(),
                 )
                 .first()
             )
@@ -384,7 +476,7 @@ def preview_document(
                     DocumentPermission.permission_level.in_(
                         [PermissionLevel.VIEW, PermissionLevel.DOWNLOAD]
                     ),
-                    DocumentPermission.is_revoked.is_(False),
+                    *_active_permission_conditions(),
                 )
                 .first()
                 is not None
@@ -432,6 +524,13 @@ def preview_document(
             detail="Document file not found",
         )
 
+    _verify_document_integrity(
+        document,
+        storage_path,
+        current_user,
+        db,
+        AuditAction.DOCUMENT_READ,
+    )
     _commit_access_audit(
         db,
         AuditEvent(
@@ -476,7 +575,7 @@ def download_document(
                     DocumentPermission.document_id == document.id,
                     DocumentPermission.grantee_id == current_user.id,
                     DocumentPermission.permission_level == PermissionLevel.DOWNLOAD,
-                    DocumentPermission.is_revoked.is_(False),
+                    *_active_permission_conditions(),
                 )
                 .first()
                 is not None
@@ -524,6 +623,13 @@ def download_document(
             detail="Document file not found",
         )
 
+    _verify_document_integrity(
+        document,
+        storage_path,
+        current_user,
+        db,
+        AuditAction.DOCUMENT_DOWNLOAD,
+    )
     _commit_access_audit(
         db,
         AuditEvent(
@@ -601,7 +707,7 @@ def list_shared_documents(
             .outerjoin(User, User.id == Document.owner_id)
             .filter(
                 DocumentPermission.grantee_id == current_user.id,
-                DocumentPermission.is_revoked.is_(False),
+                *_active_permission_conditions(),
             )
             .order_by(Document.created_at.desc())
             .all()
@@ -749,6 +855,7 @@ async def upload_document(
     storage_directory = Path(settings.STORAGE_DIR)
     storage_path = storage_directory / storage_name
     size = 0
+    digest = hashlib.sha256()
     first_chunk = True
     text_decoder = codecs.getincrementaldecoder("utf-8")() if extension == ".txt" else None
 
@@ -775,6 +882,7 @@ async def upload_document(
                 if text_decoder is not None:
                     text_decoder.decode(chunk, final=False)
                 destination.write(chunk)
+                digest.update(chunk)
 
             if size == 0:
                 raise HTTPException(
@@ -808,6 +916,7 @@ async def upload_document(
         name=filename,
         storage_path=storage_name,
         file_size=size,
+        sha256=digest.hexdigest(),
         content_type=content_type,
     )
     audit = AuditEvent(

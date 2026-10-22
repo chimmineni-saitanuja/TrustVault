@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app import __version__
 from app.config import settings
 from app.database import get_db
+from app.routers import activity as activity_router
 from app.routers import auth as auth_router
 from app.routers import documents as documents_router
 from app.routers import users as users_router
@@ -48,13 +49,14 @@ app = FastAPI(
 )
 
 app.include_router(auth_router.router, prefix="/auth", tags=["Authentication"])
+app.include_router(activity_router.router, prefix="/activity", tags=["Activity"])
 app.include_router(documents_router.router, prefix="/documents", tags=["Documents"])
 app.include_router(users_router.router, prefix="/users", tags=["Users"])
 
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.DEBUG else ["http://localhost:3000", "http://127.0.0.1:8000"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

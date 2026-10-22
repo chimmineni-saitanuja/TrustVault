@@ -172,6 +172,7 @@ class Document(Base):
         unique=True,
     )
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     content_type: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[DocumentStatus] = mapped_column(
         SQLEnum(DocumentStatus, native_enum=False, length=20),
@@ -245,6 +246,10 @@ class DocumentPermission(Base):
         DateTime(timezone=True),
         default=get_utc_now,
         nullable=False,
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     revoked_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True),

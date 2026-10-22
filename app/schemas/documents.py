@@ -1,9 +1,9 @@
 """Public document metadata schemas."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.models import DocumentStatus, PermissionLevel
 
@@ -20,6 +20,22 @@ class ShareGrantRequest(BaseModel):
 
     user_id: str
     permission: SharePermission
+    expires_at: datetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def expiration_must_be_future_and_timezone_aware(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("Expiration must include a timezone")
+        value = value.astimezone(timezone.utc)
+        if value <= datetime.now(timezone.utc):
+            raise ValueError("Expiration must be in the future")
+        return value
 
 
 class DocumentShareResponse(BaseModel):
@@ -36,6 +52,7 @@ class DocumentShareResponse(BaseModel):
     permission_level: PermissionLevel
     is_revoked: bool
     granted_at: datetime
+    expires_at: datetime | None
     revoked_at: datetime | None
 
 
