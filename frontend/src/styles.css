@@ -115,6 +115,7 @@ a {
   border-radius: 9px;
   color: #7e8196;
   font-size: 13px;
+  text-decoration: none;
 }
 
 .nav-item-active {
@@ -401,6 +402,10 @@ p {
   font-size: 10px;
 }
 
+.identity-user-id {
+  overflow-wrap: anywhere;
+}
+
 .identity-card strong {
   overflow: hidden;
   color: #46495d;
@@ -685,6 +690,10 @@ p {
 
 .documents-section {
   margin-top: 0;
+}
+
+.shared-documents-section {
+  margin-top: 28px;
 }
 
 .section-heading {
@@ -1110,6 +1119,10 @@ p {
   min-height: 90px;
   flex-direction: row;
   border-style: solid;
+}
+
+.shared-error {
+  color: #a95252;
 }
 
 .empty-icon {

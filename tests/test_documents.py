@@ -203,6 +203,69 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(event.action, AuditAction.DOCUMENT_READ)
         self.assertEqual(event.context_metadata["operation"], "list")
 
+    def test_shared_listing_returns_only_active_grants_and_combines_permissions(self):
+        owner = make_user(self.session, email="shared-list-owner@example.com")
+        recipient = make_user(self.session, email="shared-list-recipient@example.com")
+        outsider = make_user(self.session, email="shared-list-outsider@example.com")
+        view_and_download = self._make_document(owner, "view-and-download")
+        revoked = self._make_document(owner, "revoked")
+        unshared = self._make_document(owner, "unshared")
+        self.assertEqual(self._grant(owner, view_and_download, recipient, "view").status_code, 201)
+        self.assertEqual(
+            self._grant(owner, view_and_download, recipient, "download").status_code,
+            201,
+        )
+        revoked_share = self._grant(owner, revoked, recipient, "view").json()
+        self.assertEqual(
+            self.client.delete(
+                f"/documents/{revoked.id}/shares/{revoked_share['id']}",
+                headers=self._authorization(owner),
+            ).status_code,
+            204,
+        )
+        self._grant(owner, unshared, outsider, "download")
+
+        response = self.client.get(
+            "/documents/shared-with-me",
+            headers=self._authorization(recipient),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+        shared = response.json()[0]
+        self.assertEqual(shared["id"], view_and_download.id)
+        self.assertEqual(shared["filename"], view_and_download.name)
+        self.assertEqual(shared["owner_id"], owner.id)
+        self.assertEqual(shared["owner_name"], owner.name)
+        self.assertEqual(shared["owner_email"], owner.email)
+        self.assertCountEqual(shared["permissions"], ["view", "download"])
+        self.assertNotIn("storage_path", shared)
+        self.assertNotIn(revoked.id, response.text)
+        self.assertNotIn(unshared.id, response.text)
+        event = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.DOCUMENT_READ)
+            .one()
+        )
+        self.assertEqual(event.actor_id, recipient.id)
+        self.assertEqual(event.context_metadata["operation"], "list_shared")
+
+    def test_shared_listing_requires_authentication_and_hides_unshared_documents(self):
+        owner = make_user(self.session, email="shared-auth-owner@example.com")
+        recipient = make_user(self.session, email="shared-auth-recipient@example.com")
+        document = self._make_document(owner, "not-shared")
+
+        unauthenticated = self.client.get("/documents/shared-with-me")
+        no_grants = self.client.get(
+            "/documents/shared-with-me",
+            headers=self._authorization(recipient),
+        )
+
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(no_grants.status_code, 200)
+        self.assertEqual(no_grants.json(), [])
+        self.assertNotIn(document.id, no_grants.text)
+
     def test_owner_can_view_document_metadata_without_storage_path(self):
         owner = make_user(self.session, email="details-owner@example.com")
         document = self._make_document(owner, "private")
@@ -481,6 +544,106 @@ class TestDocumentUploads(unittest.TestCase):
         self.assertEqual(event.outcome.value, "success")
         self.assertEqual(event.resource_id, document.id)
         self.assertNotIn(content.decode(), str(event.context_metadata))
+
+    def test_owner_and_active_view_or_download_grants_can_preview_inline(self):
+        owner = make_user(self.session, email="preview-owner@example.com")
+        viewer = make_user(self.session, email="preview-viewer@example.com")
+        downloader = make_user(self.session, email="preview-downloader@example.com")
+        document = self._make_document(owner, "previewable")
+        content = b"%PDF-1.7\npreview content"
+        self._write_document_file(document, content)
+        self.assertEqual(self._grant(owner, document, viewer, "view").status_code, 201)
+        self.assertEqual(self._grant(owner, document, downloader, "download").status_code, 201)
+
+        owner_response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(owner),
+        )
+        viewer_response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(viewer),
+        )
+        downloader_response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(downloader),
+        )
+
+        for response in (owner_response, viewer_response, downloader_response):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, content)
+            self.assertTrue(response.headers["content-disposition"].startswith("inline;"))
+            self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+            self.assertNotIn(document.storage_path, response.headers["content-disposition"])
+        self.assertEqual(
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.DOCUMENT_READ, resource_id=document.id)
+            .count(),
+            3,
+        )
+
+    def test_unshared_user_cannot_preview_document(self):
+        owner = make_user(self.session, email="preview-unshared-owner@example.com")
+        unrelated = make_user(self.session, email="preview-unshared-user@example.com")
+        document = self._make_document(owner, "private-preview")
+        self._write_document_file(document, b"private")
+
+        response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(unrelated),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Document not found")
+        event = self.session.query(AuditEvent).filter_by(
+            action=AuditAction.ACCESS_DENIED
+        ).one()
+        self.assertEqual(event.actor_id, unrelated.id)
+
+    def test_revoked_view_grant_cannot_preview_document(self):
+        owner = make_user(self.session, email="preview-revoked-owner@example.com")
+        recipient = make_user(self.session, email="preview-revoked-user@example.com")
+        document = self._make_document(owner, "revoked-preview")
+        self._write_document_file(document, b"revoked")
+        share = self._grant(owner, document, recipient, "view").json()
+        self.assertEqual(
+            self.client.delete(
+                f"/documents/{document.id}/shares/{share['id']}",
+                headers=self._authorization(owner),
+            ).status_code,
+            204,
+        )
+
+        response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(recipient),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Document not found")
+
+    def test_preview_requires_view_or_download_permission(self):
+        owner = make_user(self.session, email="preview-limited-owner@example.com")
+        recipient = make_user(self.session, email="preview-limited-user@example.com")
+        document = self._make_document(owner, "limited-preview")
+        self._write_document_file(document, b"limited")
+        self.session.add(
+            DocumentPermission(
+                document_id=document.id,
+                grantee_id=recipient.id,
+                granted_by_id=owner.id,
+                permission_level=PermissionLevel.READ,
+                is_revoked=False,
+            )
+        )
+        self.session.commit()
+
+        response = self.client.get(
+            f"/documents/{document.id}/preview",
+            headers=self._authorization(recipient),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Document not found")
 
     def test_active_download_share_allows_download_and_view_share_does_not(self):
         owner = make_user(self.session, email="permission-download-owner@example.com")

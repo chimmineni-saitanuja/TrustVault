@@ -6,6 +6,7 @@ import {
   ChevronDown,
   CircleHelp,
   CloudUpload,
+  Eye,
   File as FileIcon,
   FileImage,
   FileText,
@@ -22,7 +23,7 @@ import {
   X,
 } from "lucide-react";
 
-import { api, ApiError, type DocumentRecord, type DocumentShare, type SharePermission, type UserProfile } from "./api";
+import { api, ApiError, type DocumentRecord, type DocumentShare, type SharePermission, type SharedDocumentRecord, type UserProfile } from "./api";
 
 const TOKEN_KEY = "trustvault.access-token";
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -59,10 +60,13 @@ export default function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem(TOKEN_KEY) ?? "");
   const [user, setUser] = useState<UserProfile | null>(null);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
+  const [sharedDocuments, setSharedDocuments] = useState<SharedDocumentRecord[]>([]);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [authLoading, setAuthLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(Boolean(token));
   const [documentsLoading, setDocumentsLoading] = useState(false);
+  const [sharedLoading, setSharedLoading] = useState(Boolean(token));
+  const [sharedError, setSharedError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -75,12 +79,16 @@ export default function App() {
   const [recipientId, setRecipientId] = useState("");
   const [permission, setPermission] = useState<SharePermission>("view");
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [previewingId, setPreviewingId] = useState<string | null>(null);
 
   const clearSession = useCallback(() => {
     sessionStorage.removeItem(TOKEN_KEY);
     setToken("");
     setUser(null);
     setDocuments([]);
+    setSharedDocuments([]);
+    setSharedError(null);
+    setSharedLoading(false);
     setShareRows({});
     setShareTarget(null);
   }, []);
@@ -106,9 +114,26 @@ export default function App() {
     }
   }, [clearSession]);
 
+  const refreshSharedDocuments = useCallback(async (activeToken: string) => {
+    setSharedLoading(true);
+    setSharedError(null);
+    try {
+      setSharedDocuments(await api.sharedDocuments(activeToken));
+    } catch (error) {
+      setSharedError(messageFromError(error));
+      if (error instanceof ApiError && error.status === 401) {
+        clearSession();
+        setNotice({ kind: "error", text: "Your session has expired. Sign in again to continue." });
+      }
+    } finally {
+      setSharedLoading(false);
+    }
+  }, [clearSession]);
+
   useEffect(() => {
     if (!token) {
       setSessionLoading(false);
+      setSharedLoading(false);
       return;
     }
 
@@ -120,6 +145,7 @@ export default function App() {
         setUser(profile);
         const rows = await api.documents(token);
         if (active) setDocuments(rows);
+        await refreshSharedDocuments(token);
       } catch (error) {
         if (!active) return;
         if (error instanceof ApiError && error.status === 401) {
@@ -137,7 +163,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [token, clearSession]);
+  }, [token, clearSession, refreshSharedDocuments]);
 
   const visibleDocuments = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -279,7 +305,7 @@ export default function App() {
     }
   }
 
-  async function downloadDocument(document: DocumentRecord) {
+  async function downloadDocument(document: Pick<DocumentRecord, "id" | "name">) {
     setDownloadingId(document.id);
     setNotice(null);
     try {
@@ -298,6 +324,31 @@ export default function App() {
       reportRequestError(error);
     } finally {
       setDownloadingId(null);
+    }
+  }
+
+  async function previewDocument(document: Pick<DocumentRecord, "id">) {
+    const previewTab = window.open("", "_blank");
+    if (!previewTab) {
+      setNotice({ kind: "error", text: "Allow pop-ups to open the document preview." });
+      return;
+    }
+
+    previewTab.opener = null;
+    previewTab.document.title = "Loading preview";
+    previewTab.document.body.textContent = "Loading authorized document preview…";
+    setPreviewingId(document.id);
+    setNotice(null);
+    try {
+      const blob = await api.preview(token, document.id);
+      const objectUrl = URL.createObjectURL(blob);
+      previewTab.location.href = objectUrl;
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 5 * 60 * 1000);
+    } catch (error) {
+      previewTab.close();
+      reportRequestError(error);
+    } finally {
+      setPreviewingId(null);
     }
   }
 
@@ -335,11 +386,16 @@ export default function App() {
         </a>
 
         <div className="workspace-label">WORKSPACE</div>
-        <div className="nav-item nav-item-active">
+        <a className="nav-item nav-item-active" href="#my-vault">
           <FolderClosed size={18} />
           <span>My vault</span>
           <span className="nav-count">{documents.length}</span>
-        </div>
+        </a>
+        <a className="nav-item" href="#shared-with-me">
+          <Share2 size={18} />
+          <span>Shared with me</span>
+          <span className="nav-count">{sharedDocuments.length}</span>
+        </a>
         <div className="sidebar-note">
           <div className="sidebar-note-icon"><LockKeyhole size={17} /></div>
           <strong>Your files stay yours</strong>
@@ -380,7 +436,11 @@ export default function App() {
             </div>
             <div className="identity-card">
               <span className="identity-icon"><UserRound size={18} /></span>
-              <span><small>Signed in as</small><strong>{user.email}</strong></span>
+              <span>
+                <small>Signed in as</small>
+                <strong>{user.email}</strong>
+                <small className="identity-user-id">User ID: {user.id}</small>
+              </span>
               <span className="role-tag">{user.role}</span>
             </div>
           </section>
@@ -441,7 +501,7 @@ export default function App() {
             <div className="upload-footnote"><LockKeyhole size={13} /> PDF, PNG, JPEG, or text · Up to 10 MB</div>
           </section>
 
-          <section className="documents-section">
+          <section className="documents-section" id="my-vault">
             <div className="section-heading">
               <div>
                 <p className="eyebrow">YOUR PRIVATE FILES</p>
@@ -539,7 +599,7 @@ export default function App() {
                             <Plus size={16} /> Grant access
                           </button>
                         </form>
-                        <p className="share-hint">The backend currently requires a recipient’s user ID. Shared-with-me browsing is not available yet.</p>
+                        <p className="share-hint">The backend currently requires a recipient’s user ID. Recipients see shared documents in their Shared with me section.</p>
 
                         <div className="share-list">
                           {sharesLoading ? (
@@ -570,6 +630,103 @@ export default function App() {
                         </div>
                       </div>
                     )}
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="documents-section shared-documents-section" id="shared-with-me">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">DOCUMENTS SHARED WITH YOU</p>
+                <h2>Shared with me <span className="heading-count">{sharedDocuments.length}</span></h2>
+              </div>
+              <button
+                className="button button-quiet"
+                onClick={() => void refreshSharedDocuments(token)}
+                disabled={sharedLoading}
+              >
+                {sharedLoading ? <span className="spinner spinner-small" /> : "Refresh"}
+              </button>
+            </div>
+
+            {sharedLoading ? (
+              <div className="state-card"><span className="spinner" /><span>Loading shared documents…</span></div>
+            ) : sharedError ? (
+              <div className="state-card shared-error" role="alert">
+                <span>{sharedError}</span>
+                <button
+                  className="button button-quiet"
+                  onClick={() => void refreshSharedDocuments(token)}
+                >
+                  Try again
+                </button>
+              </div>
+            ) : sharedDocuments.length === 0 ? (
+              <div className="empty-state">
+                <span className="empty-icon"><Share2 size={24} /></span>
+                <h3>No documents shared with you yet</h3>
+                <p>When someone grants you access to a document, it will appear here.</p>
+              </div>
+            ) : (
+              <div className="document-list">
+                <div className="document-list-header">
+                  <span>DOCUMENT</span><span>SIZE</span><span>ADDED</span><span className="actions-heading">ACCESS</span>
+                </div>
+                {sharedDocuments.map((document) => (
+                  <article className="document-card" key={document.id}>
+                    <div className="document-row">
+                      <div className="document-file">
+                        <span className="file-icon">{fileIcon(document.content_type)}</span>
+                        <span className="document-name-group">
+                          <strong title={document.filename}>{document.filename}</strong>
+                          <small>
+                            Shared by {document.owner_name ?? document.owner_email ?? "Unknown owner"}
+                            {document.owner_name && document.owner_email ? ` · ${document.owner_email}` : ""}
+                          </small>
+                        </span>
+                      </div>
+                      <span className="document-size">{formatBytes(document.file_size)}</span>
+                      <span className="document-date">{formatDate(document.created_at)}</span>
+                      <div className="document-actions">
+                        {document.permissions.map((grantedPermission) => (
+                          <span
+                            className={`permission-badge permission-${grantedPermission}`}
+                            key={grantedPermission}
+                          >
+                            {grantedPermission}
+                          </span>
+                        ))}
+                        {(document.permissions.includes("view") ||
+                          document.permissions.includes("download")) && (
+                          <button
+                            className="icon-button download-button"
+                            onClick={() => void previewDocument({ id: document.id })}
+                            disabled={previewingId === document.id}
+                            aria-label={`View ${document.filename}`}
+                            title="View"
+                          >
+                            {previewingId === document.id
+                              ? <span className="spinner spinner-small" />
+                              : <Eye size={18} />}
+                          </button>
+                        )}
+                        {document.permissions.includes("download") && (
+                          <button
+                            className="icon-button download-button"
+                            onClick={() => void downloadDocument({ id: document.id, name: document.filename })}
+                            disabled={downloadingId === document.id}
+                            aria-label={`Download ${document.filename}`}
+                            title="Download"
+                          >
+                            {downloadingId === document.id
+                              ? <span className="spinner spinner-small" />
+                              : <ArrowDownToLine size={18} />}
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   </article>
                 ))}
               </div>

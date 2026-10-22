@@ -52,3 +52,17 @@ class DocumentUploadResponse(BaseModel):
     content_type: str
     status: DocumentStatus
     created_at: datetime
+
+
+class SharedDocumentResponse(BaseModel):
+    """Document metadata and active grants visible to the shared recipient."""
+
+    id: str
+    filename: str
+    owner_id: str | None
+    owner_name: str | None
+    owner_email: str | None
+    permissions: list[SharePermission]
+    file_size: int
+    content_type: str
+    created_at: datetime

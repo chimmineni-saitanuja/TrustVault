@@ -27,7 +27,9 @@ from app.models import (
 from app.schemas.documents import (
     DocumentShareResponse,
     DocumentUploadResponse,
+    SharedDocumentResponse,
     ShareGrantRequest,
+    SharePermission,
 )
 
 logger = logging.getLogger("trustvault.documents")
@@ -357,6 +359,100 @@ def revoke_document_share(
 
 
 @router.get(
+    "/{document_id}/preview",
+    response_class=FileResponse,
+    summary="Preview an authorized document",
+)
+def preview_document(
+    document_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """Serve an owned or actively shared document inline for viewing."""
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if document is None:
+            has_view_access = False
+        elif document.owner_id == current_user.id:
+            has_view_access = True
+        else:
+            has_view_access = (
+                db.query(DocumentPermission)
+                .filter(
+                    DocumentPermission.document_id == document.id,
+                    DocumentPermission.grantee_id == current_user.id,
+                    DocumentPermission.permission_level.in_(
+                        [PermissionLevel.VIEW, PermissionLevel.DOWNLOAD]
+                    ),
+                    DocumentPermission.is_revoked.is_(False),
+                )
+                .first()
+                is not None
+            )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document preview authorization lookup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+    if document is None or not has_view_access:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=AuditAction.ACCESS_DENIED,
+                resource_id=document_id[:255],
+                outcome=AuditOutcome.DENIED,
+                reason="Document not found or view permission not granted",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+
+    storage_path = _resolve_document_storage_path(document.storage_path)
+    if storage_path is None:
+        _commit_access_audit(
+            db,
+            AuditEvent(
+                actor_id=current_user.id,
+                actor_email=current_user.email,
+                action=AuditAction.DOCUMENT_READ,
+                resource_id=document.id,
+                outcome=AuditOutcome.ERROR,
+                reason="Stored document is unavailable",
+            ),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document file not found",
+        )
+
+    _commit_access_audit(
+        db,
+        AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.DOCUMENT_READ,
+            resource_id=document.id,
+            outcome=AuditOutcome.SUCCESS,
+            context_metadata={"operation": "preview"},
+        ),
+    )
+    return FileResponse(
+        path=storage_path,
+        media_type=document.content_type,
+        filename=document.name,
+        content_disposition_type="inline",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
+@router.get(
     "/{document_id}/download",
     response_class=FileResponse,
     summary="Download an authorized document",
@@ -481,6 +577,75 @@ def list_documents(
         ),
     )
     return [DocumentUploadResponse.model_validate(document) for document in documents]
+
+
+@router.get(
+    "/shared-with-me",
+    response_model=list[SharedDocumentResponse],
+    summary="List documents shared with the current user",
+)
+def list_shared_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[SharedDocumentResponse]:
+    """List documents with active grants for the authenticated user."""
+    try:
+        rows = (
+            db.query(
+                Document,
+                User.name,
+                User.email,
+                DocumentPermission.permission_level,
+            )
+            .join(DocumentPermission, DocumentPermission.document_id == Document.id)
+            .outerjoin(User, User.id == Document.owner_id)
+            .filter(
+                DocumentPermission.grantee_id == current_user.id,
+                DocumentPermission.is_revoked.is_(False),
+            )
+            .order_by(Document.created_at.desc())
+            .all()
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Shared document listing failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document request failed",
+        )
+
+    shared_documents: dict[str, SharedDocumentResponse] = {}
+    for document, owner_name, owner_email, permission_level in rows:
+        shared = shared_documents.get(document.id)
+        if shared is None:
+            shared_documents[document.id] = SharedDocumentResponse(
+                id=document.id,
+                filename=document.name,
+                owner_id=document.owner_id,
+                owner_name=owner_name,
+                owner_email=owner_email,
+                permissions=[SharePermission(permission_level.value)],
+                file_size=document.file_size,
+                content_type=document.content_type,
+                created_at=document.created_at,
+            )
+        else:
+            shared.permissions.append(SharePermission(permission_level.value))
+
+    _commit_access_audit(
+        db,
+        AuditEvent(
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action=AuditAction.DOCUMENT_READ,
+            outcome=AuditOutcome.SUCCESS,
+            context_metadata={
+                "operation": "list_shared",
+                "document_count": len(shared_documents),
+            },
+        ),
+    )
+    return list(shared_documents.values())
 
 
 @router.get(

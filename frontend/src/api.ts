@@ -18,6 +18,18 @@ export interface DocumentRecord {
   created_at: string;
 }
 
+export interface SharedDocumentRecord {
+  id: string;
+  filename: string;
+  owner_id: string | null;
+  owner_name: string | null;
+  owner_email: string | null;
+  permissions: SharePermission[];
+  file_size: number;
+  content_type: string;
+  created_at: string;
+}
+
 export interface DocumentShare {
   id: string;
   document_id: string;
@@ -121,6 +133,10 @@ export const api = {
     return request<DocumentRecord[]>("/documents/", token);
   },
 
+  sharedDocuments(token: string): Promise<SharedDocumentRecord[]> {
+    return request<SharedDocumentRecord[]>("/documents/shared-with-me", token);
+  },
+
   upload(token: string, file: File): Promise<DocumentRecord> {
     const form = new FormData();
     form.append("file", file);
@@ -154,6 +170,19 @@ export const api = {
   async download(token: string, documentId: string): Promise<Blob> {
     const response = await fetch(
       `${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/download`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+
+    if (!response.ok) {
+      throw new ApiError(await errorMessage(response), response.status);
+    }
+
+    return response.blob();
+  },
+
+  async preview(token: string, documentId: string): Promise<Blob> {
+    const response = await fetch(
+      `${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/preview`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
 
