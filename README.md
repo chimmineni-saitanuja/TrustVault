@@ -9,10 +9,12 @@ TrustVault is a document workspace for private file storage and permission-based
 - Manage document-level `view` and `download` grants, including optional expirations and revocation.
 - Browse documents shared with the current user, preview authorized files, and download only when explicitly permitted.
 - Review recent actor-scoped events in the Activity Log; security-sensitive operations are recorded in an application-level append-only audit log.
+- Bootstrap an administrator privately, review uploaded documents, and approve or reject them with a reason.
+- Use the Admin dashboard for user/document/review totals, all-owner document search, account activation controls, permission-grant revocation, filtered audit events, and CSV audit/review-history exports.
 
 ## 2. Frontend
 
-The frontend is a React 18 and TypeScript single-page application built with Vite. It supports account registration and login, owned-document search and upload, share management, a separate **Shared with me** list, inline previews, permission-gated downloads, and an actor-scoped **Activity Log**. The bearer token is kept in browser `sessionStorage`; the default API URL is `http://127.0.0.1:8000` and can be overridden with `VITE_API_BASE_URL`.
+The frontend is a React 18 and TypeScript single-page application built with Vite. It supports account registration and login, owned-document search and upload, share management, a separate **Shared with me** list, inline previews, permission-gated downloads, and an actor-scoped **Activity Log**. Administrators also have an overview, searchable document catalog, review queue, account activation controls, global permission revocation, an audit center, and filtered CSV exports. The bearer token is kept in browser `sessionStorage`; the default API URL is `http://127.0.0.1:8000` and can be overridden with `VITE_API_BASE_URL`.
 
 ## 3. Backend API
 
@@ -24,6 +26,7 @@ FastAPI exposes interactive API documentation at `/docs`. Protected endpoints re
 | Authentication | `POST /auth/register`, `POST /auth/login`, `GET /auth/me` |
 | Users | `GET /users/` (admin only) |
 | Activity | `GET /activity/` (authenticated, actor-scoped) |
+| Administration | `GET /admin/dashboard`, `GET /admin/documents`, `GET /admin/documents/{document_id}/preview`, `POST /admin/documents/{document_id}/approve`, `POST /admin/documents/{document_id}/reject`, `POST /admin/users/{user_id}/deactivate`, `POST /admin/users/{user_id}/reactivate`, `GET /admin/permissions`, `DELETE /admin/permissions/{permission_id}`, `GET /admin/audit`, `GET /admin/reports/export` (admin only) |
 | Documents | `POST /documents/upload`, `GET /documents/`, `GET /documents/{document_id}` |
 | Sharing | `POST /documents/{document_id}/shares`, `GET /documents/{document_id}/shares`, `DELETE /documents/{document_id}/shares/{share_id}` |
 | Shared access | `GET /documents/shared-with-me`, `GET /documents/{document_id}/preview`, `GET /documents/{document_id}/download` |
@@ -34,9 +37,9 @@ SQLAlchemy 2.x models users, documents, document permissions, and audit events. 
 
 ## 5. Authentication and Authorization
 
-Passwords are hashed with Argon2id. Login issues an HS256-signed JWT whose subject identifies the user; each protected request resolves that subject to an active database account. Registration assigns the `viewer` role. Admin-only user listing and owner/admin share management are enforced by backend dependencies and route checks.
+Passwords are hashed with Argon2id. Login issues an HS256-signed JWT whose subject identifies the user; each protected request resolves that subject to an active database account. Registration assigns the `viewer` role. Admin-only user listing, account status changes, document review, audit/report access, and permission revocation are enforced by backend dependencies and route checks. Account status changes and denied role checks are audited; the last active Admin cannot be deactivated.
 
-Document ownership and grants are separate: owners can manage shares; recipients need an active, non-revoked, non-expired `view` or `download` grant to preview, and an active `download` grant to download. Grants may optionally expire at a timezone-aware timestamp, normalized to UTC; grants without an expiration remain active until revoked. An admin role alone does not grant access to another user's file. Public user and document responses omit password hashes and storage paths.
+Document ownership and grants are separate: owners can manage shares; recipients need an active, non-revoked, non-expired `view` or `download` grant to preview, and an active `download` grant to download. Grants may optionally expire at a timezone-aware timestamp, normalized to UTC; grants without an expiration remain active until revoked. New uploads await administrator review; file access and sharing are blocked until approval. Existing documents migrate as approved. Admin review previews are protected and audited; Admin status alone does not grant access to another user's file through normal document routes. Public user and document responses omit password hashes and storage paths. Admin audit responses expose only safe actor/action/outcome/time/document labels; they do not include request metadata, addresses, or storage details.
 
 ## 6. Secure File Storage and Document Sharing
 
@@ -56,7 +59,7 @@ python -m unittest
 python -m pytest -v
 ```
 
-The suite covers authentication, health checks, models, audit behavior, uploads and SHA-256 integrity, legacy hash baselines, ownership, expiring/revoked sharing, previews, downloads, and authorization failures. Build the frontend with `npm run build` from `frontend/`.
+The suite covers authentication, role enforcement, administrator review, health checks, models, audit behavior, uploads and SHA-256 integrity, legacy hash baselines, ownership, expiring/revoked sharing, previews, downloads, and authorization failures. Build the frontend with `npm run build` from `frontend/`.
 
 ## 8. Setup and Environment Configuration
 
@@ -70,6 +73,8 @@ Copy-Item .env.example .env
 alembic upgrade head
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+Create the first administrator from a trusted interactive terminal with `python -m app.bootstrap_admin`. This one-time command prompts for the account details and password without accepting credentials through command-line arguments; it refuses to run once an administrator exists. Public registration always creates a viewer account.
 
 In another terminal:
 
@@ -101,5 +106,5 @@ Generate a cryptographically random signing key (for example, generate one with 
 - Add a documented production deployment target and automated release pipeline.
 - Add malware scanning and managed/object storage lifecycle controls for uploaded files.
 - Add account recovery and user self-service administration.
-- Add pagination and filtering for large document, share, and audit histories.
+- Add pagination for large document, share, and audit histories.
 - Extend audit-log retention and tamper evidence beyond application-level ORM protections.

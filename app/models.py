@@ -53,10 +53,20 @@ class DocumentStatus(str, enum.Enum):
     ARCHIVED = "archived"
 
 
+class DocumentReviewStatus(str, enum.Enum):
+    """Administrative review state for uploaded documents."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 class AuditAction(str, enum.Enum):
     """Audit action event types."""
     # Authentication events
     USER_REGISTER = "user.register"
+    USER_DEACTIVATE = "user.deactivate"
+    USER_REACTIVATE = "user.reactivate"
     LOGIN_SUCCESS = "auth.login_success"
     LOGIN_FAILED = "auth.login_failed"
     LOGOUT = "auth.logout"
@@ -67,6 +77,9 @@ class AuditAction(str, enum.Enum):
     DOCUMENT_DOWNLOAD = "document.download"
     DOCUMENT_EDIT = "document.edit"
     DOCUMENT_DELETE = "document.delete"
+    DOCUMENT_APPROVE = "document.approve"
+    DOCUMENT_REJECT = "document.reject"
+    ADMIN_BOOTSTRAP = "admin.bootstrap"
 
     # Permission changes
     PERMISSION_GRANT = "permission.grant"
@@ -174,6 +187,21 @@ class Document(Base):
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    review_status: Mapped[DocumentReviewStatus] = mapped_column(
+        SQLEnum(DocumentReviewStatus, native_enum=False, length=20),
+        default=DocumentReviewStatus.APPROVED,
+        nullable=False,
+    )
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    reviewed_by_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     status: Mapped[DocumentStatus] = mapped_column(
         SQLEnum(DocumentStatus, native_enum=False, length=20),
         default=DocumentStatus.ACTIVE,

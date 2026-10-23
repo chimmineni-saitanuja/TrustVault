@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   ArrowDownToLine,
   ArrowRight,
@@ -15,6 +15,7 @@ import {
   KeyRound,
   LockKeyhole,
   LogOut,
+  Mail,
   Plus,
   Search,
   ShieldCheck,
@@ -24,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 
-import { api, ApiError, type ActivityEvent, type DocumentRecord, type DocumentShare, type SharePermission, type SharedDocumentRecord, type UserProfile } from "./api";
+import { api, ApiError, type ActivityEvent, type AdminActivityEvent, type AdminDashboardRecord, type AdminDocumentRecord, type AdminPermissionRecord, type DocumentRecord, type DocumentShare, type SharePermission, type SharedDocumentRecord, type UserProfile } from "./api";
 
 const TOKEN_KEY = "trustvault.access-token";
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -70,8 +71,11 @@ export default function App() {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [sharedDocuments, setSharedDocuments] = useState<SharedDocumentRecord[]>([]);
   const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([]);
+  const [showAllActivity, setShowAllActivity] = useState(false);
+  const visibleActivityEvents = showAllActivity ? activityEvents : activityEvents.slice(0, 5);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [authLoading, setAuthLoading] = useState(false);
+  const [loginUnlocking, setLoginUnlocking] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(Boolean(token));
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [sharedLoading, setSharedLoading] = useState(Boolean(token));
@@ -102,6 +106,7 @@ export default function App() {
     setSharedError(null);
     setSharedLoading(false);
     setActivityEvents([]);
+    setShowAllActivity(false);
     setActivityError(null);
     setActivityLoading(false);
     setShareRows({});
@@ -175,6 +180,7 @@ export default function App() {
         const profile = await api.me(token);
         if (!active) return;
         setUser(profile);
+        if (profile.role === "admin") return;
         const rows = await api.documents(token);
         if (active) setDocuments(rows);
         await refreshSharedDocuments(token);
@@ -188,6 +194,7 @@ export default function App() {
           setNotice({ kind: "error", text: messageFromError(error) });
         }
       } finally {
+        setLoginUnlocking(false);
         if (active) setSessionLoading(false);
       }
     };
@@ -220,6 +227,7 @@ export default function App() {
         setNotice({ kind: "success", text: "Your account is ready. Sign in to open your vault." });
       } else {
         const result = await api.login(email, password);
+        setLoginUnlocking(true);
         sessionStorage.setItem(TOKEN_KEY, result.access_token);
         setSessionLoading(true);
         setToken(result.access_token);
@@ -382,7 +390,18 @@ export default function App() {
     }
   }
 
-  async function previewDocument(document: Pick<DocumentRecord, "id">) {
+  async function previewDocument(document: Pick<DocumentRecord, "id" | "content_type">) {
+    if (
+      document.content_type !== "application/pdf" &&
+      !document.content_type.startsWith("image/")
+    ) {
+      setNotice({
+        kind: "error",
+        text: "Preview is not available for this file type. Use Download instead.",
+      });
+      return;
+    }
+
     const previewTab = window.open("", "_blank");
     if (!previewTab) {
       setNotice({ kind: "error", text: "Allow pop-ups to open the document preview." });
@@ -411,7 +430,7 @@ export default function App() {
 
   if (sessionLoading) {
     return (
-      <main className="boot-screen" aria-live="polite">
+      <main className={`boot-screen${loginUnlocking ? " boot-screen-unlocking" : ""}`} aria-live="polite">
         <span className="brand-mark"><ShieldCheck size={22} /></span>
         <p>Unlocking your private workspace…</p>
       </main>
@@ -432,6 +451,10 @@ export default function App() {
         onSubmit={submitAuth}
       />
     );
+  }
+
+  if (user.role === "admin") {
+    return <AdminDashboard token={token} user={user} onLogout={clearSession} />;
   }
 
   return (
@@ -603,6 +626,13 @@ export default function App() {
                         <span className="document-name-group">
                           <strong title={document.name}>{document.name}</strong>
                           <small>{document.content_type}</small>
+                          <small className={`review-status review-${document.review_status}`}>
+                            {document.review_status === "pending"
+                              ? "Awaiting admin review"
+                              : document.review_status === "rejected"
+                                ? `Rejected: ${document.rejection_reason ?? "See administrator"}`
+                                : "Approved"}
+                          </small>
                         </span>
                       </div>
                       <span className="document-size">{formatBytes(document.file_size)}</span>
@@ -611,15 +641,28 @@ export default function App() {
                         <button
                           className="button button-quiet"
                           onClick={() => void toggleShares(document.id)}
+                          disabled={document.review_status !== "approved"}
                           aria-expanded={shareTarget === document.id}
                           aria-controls={`shares-${document.id}`}
                         >
                           <Share2 size={15} /> Share <ChevronDown size={14} className={shareTarget === document.id ? "chevron-open" : ""} />
                         </button>
                         <button
+                          className="button button-quiet document-view-button"
+                          onClick={() => void previewDocument(document)}
+                          disabled={previewingId === document.id || document.review_status !== "approved"}
+                          aria-label={`View ${document.name}`}
+                          title="View"
+                        >
+                          {previewingId === document.id
+                            ? <span className="spinner spinner-small" />
+                            : <Eye size={15} />}
+                          View
+                        </button>
+                        <button
                           className="icon-button download-button"
                           onClick={() => void downloadDocument(document)}
-                          disabled={downloadingId === document.id}
+                          disabled={downloadingId === document.id || document.review_status !== "approved"}
                           aria-label={`Download ${document.name}`}
                           title="Download"
                         >
@@ -779,26 +822,19 @@ export default function App() {
                       <span className="document-size">{formatBytes(document.file_size)}</span>
                       <span className="document-date">{formatDate(document.created_at)}</span>
                       <div className="document-actions">
-                        {document.permissions.map((grantedPermission) => (
-                          <span
-                            className={`permission-badge permission-${grantedPermission}`}
-                            key={grantedPermission}
-                          >
-                            {grantedPermission}
-                          </span>
-                        ))}
                         {(document.permissions.includes("view") ||
                           document.permissions.includes("download")) && (
                           <button
-                            className="icon-button download-button"
-                            onClick={() => void previewDocument({ id: document.id })}
+                            className="button button-quiet document-view-button"
+                            onClick={() => void previewDocument(document)}
                             disabled={previewingId === document.id}
                             aria-label={`View ${document.filename}`}
                             title="View"
                           >
                             {previewingId === document.id
                               ? <span className="spinner spinner-small" />
-                              : <Eye size={18} />}
+                              : <Eye size={15} />}
+                            View
                           </button>
                         )}
                         {document.permissions.includes("download") && (
@@ -828,13 +864,24 @@ export default function App() {
                 <p className="eyebrow">YOUR RECENT ACCOUNT ACTIVITY</p>
                 <h2>Activity Log <span className="heading-count">{activityEvents.length}</span></h2>
               </div>
-              <button
-                className="button button-quiet"
-                onClick={() => void refreshActivity(token)}
-                disabled={activityLoading}
-              >
-                {activityLoading ? <span className="spinner spinner-small" /> : "Refresh"}
-              </button>
+              <div className="section-actions">
+                {activityEvents.length > 5 && (
+                  <button
+                    className="button button-quiet"
+                    onClick={() => setShowAllActivity((showAll) => !showAll)}
+                    aria-expanded={showAllActivity}
+                  >
+                    {showAllActivity ? "Show Recent" : <>View All <ArrowRight size={15} /></>}
+                  </button>
+                )}
+                <button
+                  className="button button-quiet"
+                  onClick={() => void refreshActivity(token)}
+                  disabled={activityLoading}
+                >
+                  {activityLoading ? <span className="spinner spinner-small" /> : "Refresh"}
+                </button>
+              </div>
             </div>
 
             {activityLoading ? (
@@ -856,8 +903,8 @@ export default function App() {
                 <p>Your account and document activity will appear here.</p>
               </div>
             ) : (
-              <div className="activity-list">
-                {activityEvents.map((event) => (
+              <div className={`activity-list${showAllActivity ? "" : " activity-preview"}`}>
+                {visibleActivityEvents.map((event) => (
                   <article className="activity-row" key={event.id}>
                     <span className={`activity-status activity-${event.outcome}`} aria-label={event.outcome} />
                     <div className="activity-details">
@@ -881,13 +928,489 @@ export default function App() {
                 ))}
               </div>
             )}
-            <p className="activity-note">Showing up to 100 recent events performed by your account. Sensitive request details are not displayed.</p>
+            <p className="activity-note">Showing {showAllActivity ? "all" : "up to 5"} of up to 100 recent events performed by your account. Sensitive request details are not displayed.</p>
           </section>
 
           <footer className="page-footer">
             <span><ShieldCheck size={15} /> Protected by TrustVault</span>
             <span>Files are private until you grant access.</span>
           </footer>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function AdminDashboard({
+  token,
+  user,
+  onLogout,
+}: {
+  token: string;
+  user: UserProfile;
+  onLogout: () => void;
+}) {
+  const [dashboard, setDashboard] = useState<AdminDashboardRecord | null>(null);
+  const [adminDocuments, setAdminDocuments] = useState<AdminDocumentRecord[]>([]);
+  const [adminPermissions, setAdminPermissions] = useState<AdminPermissionRecord[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AdminActivityEvent[]>([]);
+  const [showAllAudit, setShowAllAudit] = useState(false);
+  const visibleAuditEvents = showAllAudit ? auditEvents : auditEvents.slice(0, 5);
+  const [loading, setLoading] = useState(true);
+  const [busyDocumentId, setBusyDocumentId] = useState<string | null>(null);
+  const [previewingDocumentId, setPreviewingDocumentId] = useState<string | null>(null);
+  const [busyUserId, setBusyUserId] = useState<string | null>(null);
+  const [busyPermissionId, setBusyPermissionId] = useState<string | null>(null);
+  const [rejectionReasons, setRejectionReasons] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [documentFilters, setDocumentFilters] = useState({ owner: "", filename: "", review_status: "", upload_from: "", upload_to: "" });
+  const [auditFilters, setAuditFilters] = useState({ actor: "", action: "", outcome: "", date_from: "", date_to: "" });
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [nextDashboard, nextDocuments, nextPermissions, nextAudit] = await Promise.all([
+        api.adminDashboard(token),
+        api.adminDocuments(token, {}),
+        api.adminPermissions(token),
+        api.adminAudit(token, {}),
+      ]);
+      setDashboard(nextDashboard);
+      setAdminDocuments(nextDocuments);
+      setAdminPermissions(nextPermissions);
+      setAuditEvents(nextAudit);
+    } catch (requestError) {
+      if (requestError instanceof ApiError && requestError.status === 401) {
+        onLogout();
+      }
+      setError(messageFromError(requestError));
+    } finally {
+      setLoading(false);
+    }
+  }, [token, onLogout]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function previewPendingDocument(documentId: string) {
+    const previewTab = window.open("", "_blank");
+    if (!previewTab) {
+      setError("Allow pop-ups to open the review preview.");
+      return;
+    }
+    previewTab.opener = null;
+    previewTab.document.title = "Loading review preview";
+    previewTab.document.body.textContent = "Loading authorized document preview…";
+    setPreviewingDocumentId(documentId);
+    setError(null);
+    try {
+      const blob = await api.adminPreview(token, documentId);
+      const objectUrl = URL.createObjectURL(blob);
+      previewTab.location.href = objectUrl;
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 5 * 60 * 1000);
+    } catch (requestError) {
+      previewTab.close();
+      setError(messageFromError(requestError));
+      if (requestError instanceof ApiError && requestError.status === 401) {
+        onLogout();
+      }
+    } finally {
+      setPreviewingDocumentId(null);
+    }
+  }
+
+  async function reviewDocument(documentId: string, decision: "approve" | "reject") {
+    const reason = rejectionReasons[documentId]?.trim() ?? "";
+    if (decision === "reject" && !reason) {
+      setError("Enter a reason before rejecting this document.");
+      return;
+    }
+
+    setBusyDocumentId(documentId);
+    setError(null);
+    setNotice(null);
+    try {
+      if (decision === "approve") {
+        await api.approveDocument(token, documentId);
+      } else {
+        await api.rejectDocument(token, documentId, reason);
+      }
+      setRejectionReasons((current) => {
+        const updated = { ...current };
+        delete updated[documentId];
+        return updated;
+      });
+      setNotice(decision === "approve" ? "Document approved." : "Document rejected.");
+      await refresh();
+    } catch (requestError) {
+      if (requestError instanceof ApiError && requestError.status === 401) {
+        onLogout();
+      }
+      setError(messageFromError(requestError));
+    } finally {
+      setBusyDocumentId(null);
+    }
+  }
+
+  async function filterDocuments(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    try {
+      setAdminDocuments(await api.adminDocuments(token, documentFilters));
+    } catch (requestError) {
+      setError(messageFromError(requestError));
+    }
+  }
+
+  async function filterAudit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    try {
+      setAuditEvents(await api.adminAudit(token, auditFilters));
+    } catch (requestError) {
+      setError(messageFromError(requestError));
+    }
+  }
+
+  async function updateAccountStatus(account: UserProfile) {
+    setBusyUserId(account.id);
+    setError(null);
+    try {
+      const updated = await api.setUserActive(token, account.id, !account.is_active);
+      setDashboard((current) =>
+        current
+          ? { ...current, users: current.users.map((row) => (row.id === updated.id ? updated : row)) }
+          : current,
+      );
+      setNotice(`${updated.name} is now ${updated.is_active ? "active" : "inactive"}.`);
+      setAuditEvents(await api.adminAudit(token, auditFilters));
+    } catch (requestError) {
+      setError(messageFromError(requestError));
+    } finally {
+      setBusyUserId(null);
+    }
+  }
+
+  async function revokeAdminGrant(permission: AdminPermissionRecord) {
+    setBusyPermissionId(permission.id);
+    setError(null);
+    try {
+      await api.revokeAdminPermission(token, permission.id);
+      setAdminPermissions((current) =>
+        current.map((row) =>
+          row.id === permission.id
+            ? { ...row, is_revoked: true, revoked_at: new Date().toISOString() }
+            : row,
+        ),
+      );
+      setNotice(`Access to ${permission.document_name} has been revoked.`);
+      setAuditEvents(await api.adminAudit(token, auditFilters));
+    } catch (requestError) {
+      setError(messageFromError(requestError));
+    } finally {
+      setBusyPermissionId(null);
+    }
+  }
+
+  async function exportReport() {
+    setError(null);
+    try {
+      const report = await api.adminReport(token, auditFilters);
+      const objectUrl = URL.createObjectURL(report);
+      const anchor = window.document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = "trustvault-admin-report.csv";
+      anchor.style.display = "none";
+      window.document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (requestError) {
+      setError(messageFromError(requestError));
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <a className="brand" href="#" aria-label="TrustVault home">
+          <span className="brand-mark"><ShieldCheck size={22} strokeWidth={2.2} /></span>
+          <span>trust<span className="brand-light">vault</span></span>
+        </a>
+        <div className="workspace-label">ADMINISTRATION</div>
+        <a className="nav-item" href="#admin-overview">
+          <Activity size={18} />
+          <span>Overview</span>
+        </a>
+        <a className="nav-item" href="#admin-documents">
+          <FileText size={18} />
+          <span>All documents</span>
+          <span className="nav-count">{dashboard?.total_documents ?? 0}</span>
+        </a>
+        <a className="nav-item nav-item-active" href="#admin-review">
+          <Check size={18} />
+          <span>Document review</span>
+          <span className="nav-count">{dashboard?.pending_documents.length ?? 0}</span>
+        </a>
+        <a className="nav-item" href="#admin-users">
+          <UserRound size={18} />
+          <span>Users</span>
+          <span className="nav-count">{dashboard?.users.length ?? 0}</span>
+        </a>
+        <a className="nav-item" href="#admin-activity">
+          <Activity size={18} />
+          <span>Audit activity</span>
+        </a>
+        <a className="nav-item" href="#admin-permissions">
+          <KeyRound size={18} />
+          <span>Permissions</span>
+        </a>
+        <div className="sidebar-footer">
+          <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
+          <span className="profile-mini"><strong>{user.name}</strong><small>admin</small></span>
+          <button className="icon-button sidebar-logout" onClick={onLogout} aria-label="Log out" title="Log out">
+            <LogOut size={17} />
+          </button>
+        </div>
+      </aside>
+
+      <main className="main-area">
+        <header className="topbar">
+          <div className="breadcrumb"><span>TrustVault</span><span className="crumb-slash">/</span><strong>Admin dashboard</strong></div>
+          <div className="topbar-actions">
+            <span className="secure-pill"><span className="secure-dot" /> Administrator session</span>
+            <button className="profile-button" onClick={onLogout} title="Log out">
+              <span className="avatar avatar-small">{user.name.slice(0, 1).toUpperCase()}</span>
+              <span className="profile-button-name">{user.name}</span>
+              <LogOut size={16} />
+            </button>
+          </div>
+        </header>
+        <div className="page-content">
+          <section className="welcome-row">
+            <div>
+              <p className="eyebrow">ADMINISTRATION</p>
+              <h1>Admin <span>Dashboard.</span></h1>
+              <p className="welcome-copy">Review uploaded documents and monitor TrustVault activity.</p>
+            </div>
+            <span className="role-tag">Administrator</span>
+          </section>
+          {error && <div className="state-card shared-error" role="alert">{error}</div>}
+          {notice && <div className="state-card" role="status">{notice}</div>}
+
+          <section className="documents-section admin-section" id="admin-overview">
+            <div className="section-heading">
+              <div><p className="eyebrow">TRUSTVAULT AT A GLANCE</p><h2>Overview</h2></div>
+              <button className="button button-quiet" onClick={() => void refresh()} disabled={loading}>Refresh dashboard</button>
+            </div>
+            {dashboard && (
+              <div className="admin-metrics">
+                <article><span>Total users</span><strong>{dashboard.total_users}</strong></article>
+                <article><span>Total documents</span><strong>{dashboard.total_documents}</strong></article>
+                <article><span>Pending reviews</span><strong>{dashboard.pending_reviews}</strong></article>
+                <article><span>Approved</span><strong>{dashboard.approved_documents}</strong></article>
+                <article><span>Rejected</span><strong>{dashboard.rejected_documents}</strong></article>
+              </div>
+            )}
+          </section>
+
+          <section className="documents-section admin-section" id="admin-review">
+            <div className="section-heading">
+              <div><p className="eyebrow">OWNER SUBMISSIONS</p><h2>Awaiting review <span className="heading-count">{dashboard?.pending_documents.length ?? 0}</span></h2></div>
+              <button className="button button-quiet" onClick={() => void refresh()} disabled={loading}>Refresh</button>
+            </div>
+            {loading ? (
+              <div className="state-card"><span className="spinner" /><span>Loading administrator dashboard…</span></div>
+            ) : !dashboard?.pending_documents.length ? (
+              <div className="empty-state"><span className="empty-icon"><Check size={24} /></span><h3>No documents are waiting</h3><p>New uploads will appear here for review.</p></div>
+            ) : (
+              <div className="admin-review-list">
+                {dashboard.pending_documents.map((document) => (
+                  <article className="admin-review-card" key={document.id}>
+                    <div className="document-file">
+                      <span className="file-icon">{fileIcon(document.content_type)}</span>
+                      <span className="document-name-group">
+                        <strong title={document.name}>{document.name}</strong>
+                        <small>{document.owner_name} · {document.owner_email}</small>
+                        <small>{formatBytes(document.file_size)} · Submitted {formatActivityDate(document.created_at)}</small>
+                      </span>
+                    </div>
+                    <label className="admin-rejection-field">
+                      <span>Rejection reason (required to reject)</span>
+                      <input
+                        value={rejectionReasons[document.id] ?? ""}
+                        maxLength={500}
+                        onChange={(event) =>
+                          setRejectionReasons((current) => ({
+                            ...current,
+                            [document.id]: event.target.value,
+                          }))
+                        }
+                        placeholder="Explain what needs to change"
+                      />
+                    </label>
+                    <div className="admin-review-actions">
+                      <button
+                        className="button button-quiet"
+                        onClick={() => void previewPendingDocument(document.id)}
+                        disabled={previewingDocumentId === document.id}
+                      >
+                        <Eye size={15} /> {previewingDocumentId === document.id ? "Opening…" : "Review file"}
+                      </button>
+                      <button
+                        className="button button-primary"
+                        onClick={() => void reviewDocument(document.id, "approve")}
+                        disabled={busyDocumentId === document.id}
+                      >
+                        <Check size={15} /> Approve
+                      </button>
+                      <button
+                        className="button button-reject"
+                        onClick={() => void reviewDocument(document.id, "reject")}
+                        disabled={busyDocumentId === document.id}
+                      >
+                        <X size={15} /> Reject
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="documents-section admin-section" id="admin-documents">
+            <div className="section-heading">
+              <div><p className="eyebrow">DOCUMENT CATALOG</p><h2>All documents <span className="heading-count">{adminDocuments.length}</span></h2></div>
+            </div>
+            <form className="admin-filter-form" onSubmit={(event) => void filterDocuments(event)}>
+              <label>Owner<input value={documentFilters.owner} onChange={(event) => setDocumentFilters({ ...documentFilters, owner: event.target.value })} placeholder="Name, email, or user ID" /></label>
+              <label>Filename<input value={documentFilters.filename} onChange={(event) => setDocumentFilters({ ...documentFilters, filename: event.target.value })} placeholder="Search filename" /></label>
+              <label>Review status<select value={documentFilters.review_status} onChange={(event) => setDocumentFilters({ ...documentFilters, review_status: event.target.value })}><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select></label>
+              <label>Uploaded from<input type="date" value={documentFilters.upload_from.slice(0, 10)} onChange={(event) => setDocumentFilters({ ...documentFilters, upload_from: event.target.value ? `${event.target.value}T00:00:00` : "" })} /></label>
+              <label>Uploaded to<input type="date" value={documentFilters.upload_to.slice(0, 10)} onChange={(event) => setDocumentFilters({ ...documentFilters, upload_to: event.target.value ? `${event.target.value}T23:59:59` : "" })} /></label>
+              <button className="button button-dark" type="submit">Search documents</button>
+            </form>
+            {!loading && (
+              adminDocuments.length ? (
+                <div className="admin-review-list">
+                  {adminDocuments.map((document) => (
+                    <article className="admin-review-card" key={document.id}>
+                      <div className="document-file">
+                        <span className="file-icon">{fileIcon(document.content_type)}</span>
+                        <span className="document-name-group">
+                          <strong title={document.name}>{document.name}</strong>
+                          <small>{document.owner_name} · {document.owner_email}</small>
+                          <small>{document.category} · {formatBytes(document.file_size)} · {document.content_type}</small>
+                          <small>Uploaded {formatActivityDate(document.created_at)} · {document.status}</small>
+                          <small className={`review-status review-${document.review_status}`}>{document.review_status}{document.rejection_reason ? `: ${document.rejection_reason}` : ""}</small>
+                        </span>
+                      </div>
+                      <div className="admin-review-actions">
+                        <button className="button button-quiet" onClick={() => void previewPendingDocument(document.id)} disabled={previewingDocumentId === document.id}>
+                          <Eye size={15} /> Protected preview
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : <div className="empty-state"><h3>No documents match these filters</h3></div>
+            )}
+          </section>
+
+          <section className="documents-section admin-section" id="admin-users">
+            <div className="section-heading">
+              <div><p className="eyebrow">ACCOUNT DIRECTORY</p><h2>Users <span className="heading-count">{dashboard?.users.length ?? 0}</span></h2></div>
+            </div>
+            {!loading && dashboard && (
+              <div className="activity-list">
+                {dashboard.users.map((account) => (
+                  <div className="activity-row" key={account.id}>
+                    <span className={`activity-status ${account.is_active ? "" : "activity-denied"}`} />
+                    <span className="activity-details">
+                      <strong>{account.name}</strong>
+                      <small>{account.email} · {account.id}</small>
+                    </span>
+                    <span className="role-tag">{account.role}</span>
+                    <time>{account.is_active ? "Active" : "Inactive"} · Joined {formatDate(account.created_at)}</time>
+                    <button className="button button-quiet" onClick={() => void updateAccountStatus(account)} disabled={busyUserId === account.id || (account.role === "admin" && account.id === user.id && account.is_active)}>
+                      {busyUserId === account.id ? <span className="spinner spinner-small" /> : account.is_active ? "Deactivate" : "Reactivate"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="documents-section admin-section" id="admin-permissions">
+            <div className="section-heading">
+              <div><p className="eyebrow">ACCESS CONTROL</p><h2>Document grants <span className="heading-count">{adminPermissions.length}</span></h2></div>
+              <button className="button button-quiet" onClick={() => void refresh()} disabled={loading}>Refresh</button>
+            </div>
+            <div className="activity-list">
+              {adminPermissions.length ? adminPermissions.map((grant) => (
+                <div className="activity-row" key={grant.id}>
+                  <span className={`activity-status ${grant.is_revoked ? "activity-denied" : ""}`} />
+                  <span className="activity-details">
+                    <strong>{grant.document_name} · {grant.permission_level}</strong>
+                    <small>{grant.grantee_name} ({grant.grantee_email}) · Owner {grant.owner_email}</small>
+                    <small>Granted {formatActivityDate(grant.granted_at)}{grant.expires_at ? ` · Expires ${formatActivityDate(grant.expires_at)}` : ""}</small>
+                  </span>
+                  {grant.is_revoked ? <span className="revoked-label">Revoked</span> : (
+                    <button className="revoke-button" onClick={() => void revokeAdminGrant(grant)} disabled={busyPermissionId === grant.id}>
+                      {busyPermissionId === grant.id ? <span className="spinner spinner-small" /> : <><Trash2 size={14} /> Revoke</>}
+                    </button>
+                  )}
+                </div>
+              )) : <div className="empty-state"><h3>No document grants</h3></div>}
+            </div>
+          </section>
+
+          <section className="documents-section admin-section" id="admin-activity">
+            <div className="section-heading">
+              <div><p className="eyebrow">SECURITY AUDIT</p><h2>Security &amp; Audit Center <span className="heading-count">{auditEvents.length}</span></h2></div>
+              <div className="section-actions">
+                {auditEvents.length > 5 && (
+                  <button
+                    className="button button-quiet"
+                    onClick={() => setShowAllAudit((showAll) => !showAll)}
+                    aria-expanded={showAllAudit}
+                  >
+                    {showAllAudit ? "Show Recent" : <>View All <ArrowRight size={15} /></>}
+                  </button>
+                )}
+                <button className="button button-quiet" onClick={() => void exportReport()}>Export filtered report</button>
+              </div>
+            </div>
+            <form className="admin-filter-form" onSubmit={(event) => void filterAudit(event)}>
+              <label>Actor<input value={auditFilters.actor} onChange={(event) => setAuditFilters({ ...auditFilters, actor: event.target.value })} placeholder="Email contains…" /></label>
+              <label>Action<input value={auditFilters.action} onChange={(event) => setAuditFilters({ ...auditFilters, action: event.target.value })} placeholder="Exact action name" /></label>
+              <label>Outcome<select value={auditFilters.outcome} onChange={(event) => setAuditFilters({ ...auditFilters, outcome: event.target.value })}><option value="">Any outcome</option><option value="success">Success</option><option value="denied">Denied</option><option value="error">Error</option></select></label>
+              <label>From<input type="date" value={auditFilters.date_from.slice(0, 10)} onChange={(event) => setAuditFilters({ ...auditFilters, date_from: event.target.value ? `${event.target.value}T00:00:00` : "" })} /></label>
+              <label>To<input type="date" value={auditFilters.date_to.slice(0, 10)} onChange={(event) => setAuditFilters({ ...auditFilters, date_to: event.target.value ? `${event.target.value}T23:59:59` : "" })} /></label>
+              <button className="button button-dark" type="submit">Filter audit</button>
+            </form>
+            {!loading && (
+              auditEvents.length ? (
+                <div className={`activity-list${showAllAudit ? "" : " activity-preview"}`}>
+                  {visibleAuditEvents.map((event) => (
+                    <div className="activity-row" key={event.id}>
+                      <span className={`activity-status ${event.outcome === "denied" ? "activity-denied" : event.outcome === "error" ? "activity-error" : ""}`} />
+                      <span className="activity-details">
+                        <strong>{event.action.replaceAll(".", " ")}</strong>
+                        <small>{event.actor_email ?? "Unknown actor"}{event.document_name ? ` · ${event.document_name}` : ""}</small>
+                      </span>
+                      <span className={`activity-outcome activity-outcome-${event.outcome}`}>{event.outcome}</span>
+                      <time>{formatActivityDate(event.created_at)}</time>
+                    </div>
+                  ))}
+                </div>
+              ) : <div className="empty-state"><h3>No audit activity matches these filters</h3></div>
+            )}
+            <p className="activity-note">Audit metadata, addresses, and storage details are not exposed.</p>
+          </section>
         </div>
       </main>
     </div>
@@ -905,9 +1428,49 @@ interface AuthScreenProps {
 
 function AuthScreen({ mode, setMode, loading, notice, onDismissNotice, onSubmit }: AuthScreenProps) {
   const registering = mode === "register";
+  const vaultSceneRef = useRef<HTMLDivElement>(null);
+
+  function moveVaultScene(event: ReactPointerEvent<HTMLElement>) {
+    if (
+      event.pointerType !== "mouse" ||
+      window.matchMedia("(max-width: 780px)").matches ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const horizontal = (event.clientX - bounds.left) / bounds.width - 0.5;
+    const vertical = (event.clientY - bounds.top) / bounds.height - 0.5;
+    vaultSceneRef.current?.style.setProperty("--pointer-x", `${horizontal * 9}px`);
+    vaultSceneRef.current?.style.setProperty("--pointer-y", `${vertical * 7}px`);
+  }
+
+  function resetVaultScene() {
+    vaultSceneRef.current?.style.setProperty("--pointer-x", "0px");
+    vaultSceneRef.current?.style.setProperty("--pointer-y", "0px");
+  }
+
   return (
-    <main className="auth-layout">
+    <main className="auth-layout" onPointerMove={moveVaultScene} onPointerLeave={resetVaultScene}>
       <section className="auth-story">
+        <div className="vault-scene" aria-hidden="true" ref={vaultSceneRef}>
+          <span className="vault-beam vault-beam-one" />
+          <span className="vault-beam vault-beam-two" />
+          <span className="vault-ring vault-ring-one" />
+          <span className="vault-ring vault-ring-two" />
+          <span className="vault-ring vault-ring-three" />
+          <span className="vault-core">
+            <ShieldCheck className="vault-shield" size={88} strokeWidth={1.15} />
+          </span>
+          <span className="vault-document vault-document-one"><FileText size={20} /><i>PDF</i></span>
+          <span className="vault-document vault-document-two"><FileImage size={19} /><i>IMAGE</i></span>
+          <span className="vault-document vault-document-three"><FileText size={18} /><i>FILE</i></span>
+          <span className="vault-particle vault-particle-one" />
+          <span className="vault-particle vault-particle-two" />
+          <span className="vault-particle vault-particle-three" />
+          <span className="vault-particle vault-particle-four" />
+          <span className="vault-trail vault-trail-one" />
+          <span className="vault-trail vault-trail-two" />
+          <span className="vault-trail vault-trail-three" />
+        </div>
         <a className="brand brand-light" href="#" aria-label="TrustVault">
           <span className="brand-mark brand-mark-glass"><ShieldCheck size={22} strokeWidth={2.2} /></span>
           <span>trust<span className="brand-light-word">vault</span></span>
@@ -942,16 +1505,25 @@ function AuthScreen({ mode, setMode, loading, notice, onDismissNotice, onSubmit 
             {registering && (
               <label>
                 <span>Full name</span>
-                <input name="name" type="text" placeholder="Your name" autoComplete="name" maxLength={120} required />
+                <span className="auth-input-shell">
+                  <UserRound size={17} aria-hidden="true" />
+                  <input name="name" type="text" placeholder="Your name" autoComplete="name" maxLength={120} required />
+                </span>
               </label>
             )}
             <label>
               <span>Email address</span>
-              <input name="email" type="email" placeholder="you@example.com" autoComplete="email" required />
+              <span className="auth-input-shell">
+                <Mail size={17} aria-hidden="true" />
+                <input name="email" type="email" placeholder="you@example.com" autoComplete="email" required />
+              </span>
             </label>
             <label>
               <span>Password</span>
-              <input name="password" type="password" placeholder={registering ? "At least 8 characters" : "Enter your password"} autoComplete={registering ? "new-password" : "current-password"} minLength={registering ? 8 : undefined} required />
+              <span className="auth-input-shell">
+                <KeyRound size={17} aria-hidden="true" />
+                <input name="password" type="password" placeholder={registering ? "At least 8 characters" : "Enter your password"} autoComplete={registering ? "new-password" : "current-password"} minLength={registering ? 8 : undefined} required />
+              </span>
             </label>
             <button className="button button-auth" type="submit" disabled={loading}>
               {loading ? <span className="spinner spinner-light" /> : null}

@@ -21,6 +21,7 @@ from app.models import (
     AuditOutcome,
     Document,
     DocumentPermission,
+    DocumentReviewStatus,
     PermissionLevel,
     User,
     UserRole,
@@ -194,6 +195,11 @@ def _get_shareable_document(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found",
+        )
+    if document.review_status != DocumentReviewStatus.APPROVED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document is not approved for sharing",
         )
     return document
 
@@ -466,20 +472,23 @@ def preview_document(
         if document is None:
             has_view_access = False
         elif document.owner_id == current_user.id:
-            has_view_access = True
+            has_view_access = document.review_status == DocumentReviewStatus.APPROVED
         else:
             has_view_access = (
-                db.query(DocumentPermission)
-                .filter(
-                    DocumentPermission.document_id == document.id,
-                    DocumentPermission.grantee_id == current_user.id,
-                    DocumentPermission.permission_level.in_(
-                        [PermissionLevel.VIEW, PermissionLevel.DOWNLOAD]
-                    ),
-                    *_active_permission_conditions(),
+                document.review_status == DocumentReviewStatus.APPROVED
+                and (
+                    db.query(DocumentPermission)
+                    .filter(
+                        DocumentPermission.document_id == document.id,
+                        DocumentPermission.grantee_id == current_user.id,
+                        DocumentPermission.permission_level.in_(
+                            [PermissionLevel.VIEW, PermissionLevel.DOWNLOAD]
+                        ),
+                        *_active_permission_conditions(),
+                    )
+                    .first()
+                    is not None
                 )
-                .first()
-                is not None
             )
     except SQLAlchemyError:
         db.rollback()
@@ -567,18 +576,21 @@ def download_document(
         if document is None:
             has_download_access = False
         elif document.owner_id == current_user.id:
-            has_download_access = True
+            has_download_access = document.review_status == DocumentReviewStatus.APPROVED
         else:
             has_download_access = (
-                db.query(DocumentPermission)
-                .filter(
-                    DocumentPermission.document_id == document.id,
-                    DocumentPermission.grantee_id == current_user.id,
-                    DocumentPermission.permission_level == PermissionLevel.DOWNLOAD,
-                    *_active_permission_conditions(),
+                document.review_status == DocumentReviewStatus.APPROVED
+                and (
+                    db.query(DocumentPermission)
+                    .filter(
+                        DocumentPermission.document_id == document.id,
+                        DocumentPermission.grantee_id == current_user.id,
+                        DocumentPermission.permission_level == PermissionLevel.DOWNLOAD,
+                        *_active_permission_conditions(),
+                    )
+                    .first()
+                    is not None
                 )
-                .first()
-                is not None
             )
     except SQLAlchemyError:
         db.rollback()
@@ -706,6 +718,7 @@ def list_shared_documents(
             .join(DocumentPermission, DocumentPermission.document_id == Document.id)
             .outerjoin(User, User.id == Document.owner_id)
             .filter(
+                Document.review_status == DocumentReviewStatus.APPROVED,
                 DocumentPermission.grantee_id == current_user.id,
                 *_active_permission_conditions(),
             )
@@ -782,7 +795,7 @@ def get_document(
             detail="Document request failed",
         )
 
-    if document is None:
+    if document is None or document.review_status != DocumentReviewStatus.APPROVED:
         _commit_access_audit(
             db,
             AuditEvent(
@@ -791,7 +804,7 @@ def get_document(
                 action=AuditAction.ACCESS_DENIED,
                 resource_id=document_id[:255],
                 outcome=AuditOutcome.DENIED,
-                reason="Document not found or not owned by user",
+                reason="Document not found, not owned by user, or not approved",
             ),
         )
         raise HTTPException(
@@ -905,7 +918,7 @@ async def upload_document(
         logger.exception("Document upload storage failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document upload failed",
+            detail="Document storage failed. Check that private storage is writable.",
         )
     finally:
         await file.close()
@@ -918,6 +931,7 @@ async def upload_document(
         file_size=size,
         sha256=digest.hexdigest(),
         content_type=content_type,
+        review_status=DocumentReviewStatus.PENDING,
     )
     audit = AuditEvent(
         actor_id=current_user.id,
@@ -941,7 +955,10 @@ async def upload_document(
         logger.exception("Document metadata or audit persistence failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document upload failed",
+            detail=(
+                "Document metadata could not be saved. Check database migrations "
+                "and review server logs."
+            ),
         )
 
     return DocumentUploadResponse.model_validate(document)

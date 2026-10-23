@@ -5,16 +5,19 @@ No passwords, tokens, or secret keys are logged.
 """
 
 from collections.abc import Callable
+import logging
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User, UserRole
+from app.models import AuditAction, AuditEvent, AuditOutcome, User, UserRole
 from app.security import decode_access_token
 
 _bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger("trustvault.authorization")
 
 
 def get_current_user(
@@ -74,8 +77,29 @@ def require_role(*roles: UserRole) -> Callable:
     Returns HTTP 403 if the user's role is not in the allowed set.
     The error message does not reveal which roles are permitted.
     """
-    def _dependency(current_user: User = Depends(get_current_user)) -> User:
+    def _dependency(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ) -> User:
         if current_user.role not in roles:
+            try:
+                db.add(
+                    AuditEvent(
+                        actor_id=current_user.id,
+                        actor_email=current_user.email,
+                        action=AuditAction.ACCESS_DENIED,
+                        outcome=AuditOutcome.DENIED,
+                        reason="Role authorization denied",
+                    )
+                )
+                db.commit()
+            except SQLAlchemyError:
+                db.rollback()
+                logger.exception("Authorization denial audit persistence failed")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Authorization request failed",
+                )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient permissions",

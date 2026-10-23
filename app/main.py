@@ -20,6 +20,7 @@ from app import __version__
 from app.config import settings
 from app.database import get_db
 from app.routers import activity as activity_router
+from app.routers import admin as admin_router
 from app.routers import auth as auth_router
 from app.routers import documents as documents_router
 from app.routers import users as users_router
@@ -50,6 +51,7 @@ app = FastAPI(
 
 app.include_router(auth_router.router, prefix="/auth", tags=["Authentication"])
 app.include_router(activity_router.router, prefix="/activity", tags=["Activity"])
+app.include_router(admin_router.router, prefix="/admin", tags=["Administration"])
 app.include_router(documents_router.router, prefix="/documents", tags=["Documents"])
 app.include_router(users_router.router, prefix="/users", tags=["Users"])
 

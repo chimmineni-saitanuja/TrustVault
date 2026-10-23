@@ -14,6 +14,8 @@ export interface DocumentRecord {
   category: string;
   file_size: number;
   content_type: string;
+  review_status: "pending" | "approved" | "rejected";
+  rejection_reason: string | null;
   status: string;
   created_at: string;
 }
@@ -53,6 +55,62 @@ export interface ActivityEvent {
   document_name: string | null;
   related_user_name: string | null;
   related_user_email: string | null;
+}
+
+export interface AdminActivityEvent {
+  id: string;
+  actor_email: string | null;
+  action: string;
+  outcome: "success" | "denied" | "error";
+  created_at: string;
+  document_id: string | null;
+  document_name: string | null;
+}
+
+export interface AdminPendingDocument {
+  id: string;
+  name: string;
+  owner_id: string;
+  owner_name: string;
+  owner_email: string;
+  file_size: number;
+  content_type: string;
+  review_status: "pending" | "approved" | "rejected";
+  created_at: string;
+}
+
+export interface AdminDocumentRecord extends AdminPendingDocument {
+  category: string;
+  status: string;
+  rejection_reason: string | null;
+  reviewed_at: string | null;
+}
+
+export interface AdminPermissionRecord {
+  id: string;
+  document_id: string;
+  document_name: string;
+  owner_email: string;
+  grantee_id: string;
+  grantee_name: string;
+  grantee_email: string;
+  granted_by_id: string;
+  permission_level: "view" | "download" | "read" | "edit";
+  is_revoked: boolean;
+  granted_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface AdminDashboardRecord {
+  users: UserProfile[];
+  activity: AdminActivityEvent[];
+  pending_documents: AdminPendingDocument[];
+  total_users: number;
+  total_documents: number;
+  pending_reviews: number;
+  approved_documents: number;
+  rejected_documents: number;
 }
 
 export type SharePermission = "view" | "download";
@@ -151,6 +209,92 @@ export const api = {
 
   activity(token: string): Promise<ActivityEvent[]> {
     return request<ActivityEvent[]>("/activity/", token);
+  },
+
+  adminDashboard(token: string): Promise<AdminDashboardRecord> {
+    return request<AdminDashboardRecord>("/admin/dashboard", token);
+  },
+
+  adminDocuments(
+    token: string,
+    filters: { owner?: string; owner_id?: string; filename?: string; review_status?: string; upload_from?: string; upload_to?: string },
+  ): Promise<AdminDocumentRecord[]> {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+    });
+    return request<AdminDocumentRecord[]>(`/admin/documents?${params.toString()}`, token);
+  },
+
+  adminAudit(
+    token: string,
+    filters: { actor?: string; action?: string; outcome?: string; date_from?: string; date_to?: string },
+  ): Promise<AdminActivityEvent[]> {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+    });
+    return request<AdminActivityEvent[]>(`/admin/audit?${params.toString()}`, token);
+  },
+
+  adminPermissions(token: string): Promise<AdminPermissionRecord[]> {
+    return request<AdminPermissionRecord[]>("/admin/permissions", token);
+  },
+
+  revokeAdminPermission(token: string, permissionId: string): Promise<void> {
+    return request<void>(`/admin/permissions/${encodeURIComponent(permissionId)}`, token, {
+      method: "DELETE",
+    });
+  },
+
+  setUserActive(token: string, userId: string, active: boolean): Promise<UserProfile> {
+    return request<UserProfile>(
+      `/admin/users/${encodeURIComponent(userId)}/${active ? "reactivate" : "deactivate"}`,
+      token,
+      { method: "POST" },
+    );
+  },
+
+  async adminReport(
+    token: string,
+    filters: { actor?: string; action?: string; outcome?: string; date_from?: string; date_to?: string },
+  ): Promise<Blob> {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+    });
+    const response = await fetch(`${API_BASE_URL}/admin/reports/export?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
+    return response.blob();
+  },
+
+  approveDocument(token: string, documentId: string): Promise<DocumentRecord> {
+    return request<DocumentRecord>(
+      `/admin/documents/${encodeURIComponent(documentId)}/approve`,
+      token,
+      { method: "POST" },
+    );
+  },
+
+  rejectDocument(token: string, documentId: string, reason: string): Promise<DocumentRecord> {
+    return request<DocumentRecord>(
+      `/admin/documents/${encodeURIComponent(documentId)}/reject`,
+      token,
+      { method: "POST", body: JSON.stringify({ reason }) },
+    );
+  },
+
+  async adminPreview(token: string, documentId: string): Promise<Blob> {
+    const response = await fetch(
+      `${API_BASE_URL}/admin/documents/${encodeURIComponent(documentId)}/preview`,
+      { headers: { Authorization: "Bearer " + token } },
+    );
+    if (!response.ok) {
+      throw new ApiError(await errorMessage(response), response.status);
+    }
+    return response.blob();
   },
 
   upload(token: string, file: File): Promise<DocumentRecord> {

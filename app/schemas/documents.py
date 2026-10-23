@@ -5,7 +5,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from app.models import DocumentStatus, PermissionLevel
+from app.models import DocumentReviewStatus, DocumentStatus, PermissionLevel
 
 
 class SharePermission(str, Enum):
@@ -67,6 +67,8 @@ class DocumentUploadResponse(BaseModel):
     category: str
     file_size: int
     content_type: str
+    review_status: DocumentReviewStatus
+    rejection_reason: str | None
     status: DocumentStatus
     created_at: datetime
 
@@ -83,3 +85,17 @@ class SharedDocumentResponse(BaseModel):
     file_size: int
     content_type: str
     created_at: datetime
+
+
+class DocumentReviewRequest(BaseModel):
+    """Rejection reason required to reject a pending document."""
+
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def rejection_reason_is_required(cls, value: str) -> str:
+        reason = value.strip()
+        if not reason or len(reason) > 500:
+            raise ValueError("Rejection reason must contain 1 to 500 characters")
+        return reason

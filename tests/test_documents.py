@@ -18,6 +18,7 @@ from app.models import (
     AuditEvent,
     Document,
     DocumentPermission,
+    DocumentReviewStatus,
     PermissionLevel,
     User,
     UserRole,
@@ -258,6 +259,7 @@ class TestDocumentUploads(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 500)
+        self.assertIn("Check database migrations", response.json()["detail"])
         self.assertEqual(self.session.query(Document).count(), 0)
         self.assertEqual(self.session.query(AuditEvent).count(), 0)
         self.assertEqual(list(self.storage_path.iterdir()), [])
@@ -727,6 +729,36 @@ class TestDocumentUploads(unittest.TestCase):
             action=AuditAction.ACCESS_DENIED
         ).one()
         self.assertEqual(event.actor_id, unrelated.id)
+
+    def test_owner_cannot_preview_pending_or_rejected_documents(self):
+        owner = make_user(self.session, email="preview-unapproved-owner@example.com")
+
+        for review_status in (
+            DocumentReviewStatus.PENDING,
+            DocumentReviewStatus.REJECTED,
+        ):
+            document = self._make_document(owner, f"unapproved-{review_status.value}")
+            document.review_status = review_status
+            self.session.commit()
+            self._write_document_file(document, b"not approved")
+
+            response = self.client.get(
+                f"/documents/{document.id}/preview",
+                headers=self._authorization(owner),
+            )
+
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["detail"], "Document not found")
+
+        denied_events = (
+            self.session.query(AuditEvent)
+            .filter_by(action=AuditAction.ACCESS_DENIED, actor_id=owner.id)
+            .all()
+        )
+        self.assertEqual(len(denied_events), 2)
+        self.assertTrue(
+            all(event.outcome.value == "denied" for event in denied_events)
+        )
 
     def test_revoked_view_grant_cannot_preview_document(self):
         owner = make_user(self.session, email="preview-revoked-owner@example.com")
